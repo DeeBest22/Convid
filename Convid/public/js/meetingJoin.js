@@ -8,7 +8,6 @@ class WebRTCManager {
           this.isScreenSharing = false;
           this.audioContext = null;
           this.isReady = false;
-          this.originalMicrophoneTrack = null;
           
           this.configuration = {
             iceServers: [
@@ -59,9 +58,6 @@ class WebRTCManager {
                 autoGainControl: true
               }
             });
-            
-            // Store original microphone track
-            this.originalMicrophoneTrack = this.localStream.getAudioTracks()[0];
             
             // Start audio level monitoring
             this.startAudioLevelMonitoring();
@@ -312,92 +308,22 @@ class WebRTCManager {
 
         async startScreenShare() {
           try {
-            console.log('Starting screen share with audio...');
-            
-            // Request screen share with enhanced audio options
             this.screenStream = await navigator.mediaDevices.getDisplayMedia({
-              video: { 
-                cursor: 'always',
-                displaySurface: 'monitor',
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-                frameRate: { ideal: 30 }
-              },
-              audio: {
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false,
-                suppressLocalAudioPlayback: false,
-                sampleRate: 48000,
-                channelCount: 2
-              }
+              video: { cursor: 'always' },
+              audio: true
             });
 
-            console.log('Screen stream obtained:', this.screenStream);
-            console.log('Video tracks:', this.screenStream.getVideoTracks().length);
-            console.log('Audio tracks:', this.screenStream.getAudioTracks().length);
-
-            // Get tracks from screen stream
-            const screenVideoTrack = this.screenStream.getVideoTracks()[0];
-            const screenAudioTracks = this.screenStream.getAudioTracks();
-
             // Replace video track in all peer connections
+            const videoTrack = this.screenStream.getVideoTracks()[0];
+            
             for (const [socketId, peerConnection] of this.peerConnections) {
-              const videoSender = peerConnection.getSenders().find(s => 
+              const sender = peerConnection.getSenders().find(s => 
                 s.track && s.track.kind === 'video'
               );
               
-              if (videoSender && screenVideoTrack) {
-                console.log(`Replacing video track for peer ${socketId}`);
-                await videoSender.replaceTrack(screenVideoTrack);
+              if (sender) {
+                await sender.replaceTrack(videoTrack);
               }
-            }
-
-            // Handle screen share audio
-            if (screenAudioTracks.length > 0) {
-              console.log('System audio detected, replacing audio tracks...');
-              
-              // Create a new MediaStream that combines microphone and system audio
-              const combinedAudioStream = await this.createCombinedAudioStream(screenAudioTracks[0]);
-              
-              if (combinedAudioStream) {
-                const combinedAudioTrack = combinedAudioStream.getAudioTracks()[0];
-                
-                // Replace audio track in all peer connections
-                for (const [socketId, peerConnection] of this.peerConnections) {
-                  const audioSender = peerConnection.getSenders().find(s => 
-                    s.track && s.track.kind === 'audio'
-                  );
-                  
-                  if (audioSender && combinedAudioTrack) {
-                    console.log(`Replacing audio track for peer ${socketId} with combined audio`);
-                    await audioSender.replaceTrack(combinedAudioTrack);
-                  } else if (!audioSender && combinedAudioTrack) {
-                    console.log(`Adding combined audio track for peer ${socketId}`);
-                    peerConnection.addTrack(combinedAudioTrack, combinedAudioStream);
-                  }
-                }
-              } else {
-                // Fallback: just use system audio
-                const systemAudioTrack = screenAudioTracks[0];
-                
-                for (const [socketId, peerConnection] of this.peerConnections) {
-                  const audioSender = peerConnection.getSenders().find(s => 
-                    s.track && s.track.kind === 'audio'
-                  );
-                  
-                  if (audioSender) {
-                    console.log(`Replacing audio track for peer ${socketId} with system audio only`);
-                    await audioSender.replaceTrack(systemAudioTrack);
-                  } else {
-                    console.log(`Adding system audio track for peer ${socketId}`);
-                    peerConnection.addTrack(systemAudioTrack, this.screenStream);
-                  }
-                }
-              }
-            } else {
-              console.log('No system audio available for screen share');
-              // Keep using microphone audio
             }
 
             // Update local video to show screen share
@@ -415,25 +341,15 @@ class WebRTCManager {
                 label.className = 'video-label';
                 localWrapper.appendChild(label);
               }
-              label.innerHTML = '<i class="fas fa-desktop"></i> Screen Share' + 
-                (screenAudioTracks.length > 0 ? ' (with audio)' : '');
+              label.innerHTML = '<i class="fas fa-desktop"></i> Screen Share';
             }
 
             // Handle screen share end
-            screenVideoTrack.onended = () => {
-              console.log('Screen share ended');
+            videoTrack.onended = () => {
               this.stopScreenShare();
             };
 
-            // Handle audio track end if present
-            if (screenAudioTracks.length > 0) {
-              screenAudioTracks[0].onended = () => {
-                console.log('Screen share audio ended');
-              };
-            }
-
             this.isScreenSharing = true;
-            console.log('Screen share started successfully');
             
           } catch (error) {
             console.error('Error starting screen share:', error);
@@ -441,97 +357,23 @@ class WebRTCManager {
           }
         }
 
-        async createCombinedAudioStream(systemAudioTrack) {
-          try {
-            if (!this.audioContext) {
-              this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-
-            // Resume audio context if suspended
-            if (this.audioContext.state === 'suspended') {
-              await this.audioContext.resume();
-            }
-
-            // Create audio sources
-            const systemAudioSource = this.audioContext.createMediaStreamSource(
-              new MediaStream([systemAudioTrack])
-            );
-            
-            let microphoneSource = null;
-            if (this.originalMicrophoneTrack && this.originalMicrophoneTrack.enabled) {
-              microphoneSource = this.audioContext.createMediaStreamSource(
-                new MediaStream([this.originalMicrophoneTrack])
-              );
-            }
-
-            // Create gain nodes for volume control
-            const systemGain = this.audioContext.createGain();
-            const micGain = this.audioContext.createGain();
-            const outputGain = this.audioContext.createGain();
-
-            // Set gain levels
-            systemGain.gain.value = 1.0; // Full system audio
-            micGain.gain.value = 0.7;    // Slightly reduced microphone
-            outputGain.gain.value = 1.0;
-
-            // Create destination for combined audio
-            const destination = this.audioContext.createMediaStreamDestination();
-
-            // Connect audio graph
-            systemAudioSource.connect(systemGain);
-            systemGain.connect(outputGain);
-
-            if (microphoneSource) {
-              microphoneSource.connect(micGain);
-              micGain.connect(outputGain);
-            }
-
-            outputGain.connect(destination);
-
-            console.log('Combined audio stream created successfully');
-            return destination.stream;
-
-          } catch (error) {
-            console.error('Error creating combined audio stream:', error);
-            return null;
-          }
-        }
-
         async stopScreenShare() {
-          console.log('Stopping screen share...');
-          
           if (this.screenStream) {
-            this.screenStream.getTracks().forEach(track => {
-              console.log(`Stopping track: ${track.kind}`);
-              track.stop();
-            });
+            this.screenStream.getTracks().forEach(track => track.stop());
             this.screenStream = null;
           }
 
-          // Replace back to camera video and microphone audio
+          // Replace back to camera video
           if (this.localStream) {
             const videoTrack = this.localStream.getVideoTracks()[0];
-            const audioTrack = this.originalMicrophoneTrack || this.localStream.getAudioTracks()[0];
             
             for (const [socketId, peerConnection] of this.peerConnections) {
-              // Replace video track back to camera
-              const videoSender = peerConnection.getSenders().find(s => 
+              const sender = peerConnection.getSenders().find(s => 
                 s.track && s.track.kind === 'video'
               );
               
-              if (videoSender && videoTrack) {
-                console.log(`Restoring camera video for peer ${socketId}`);
-                await videoSender.replaceTrack(videoTrack);
-              }
-
-              // Replace audio track back to microphone
-              const audioSender = peerConnection.getSenders().find(s => 
-                s.track && s.track.kind === 'audio'
-              );
-              
-              if (audioSender && audioTrack) {
-                console.log(`Restoring microphone audio for peer ${socketId}`);
-                await audioSender.replaceTrack(audioTrack);
+              if (sender) {
+                await sender.replaceTrack(videoTrack);
               }
             }
 
@@ -552,32 +394,35 @@ class WebRTCManager {
           }
 
           this.isScreenSharing = false;
-          console.log('Screen share stopped successfully');
         }
       }
 
-      class ParticipantMeeting {
+      class JoinMeeting {
         constructor() {
           this.socket = io();
           this.meetingId = window.location.pathname.split('/').pop();
           this.userName = '';
           this.isHost = false;
-          this.isCoHost = false;
           this.participants = new Map();
           this.currentView = 'sidebar';
           this.spotlightedParticipant = null;
-          this.pinnedParticipant = null;
           this.webrtc = new WebRTCManager(this.socket);
           this.participantsPanelOpen = false;
           this.searchTerm = '';
           this.reactionManager = null;
+          this.meetingPermissions = {
+            chatEnabled: true,
+            fileShareEnabled: true,
+            emojiReactionsEnabled: true,
+            privateMessagesEnabled: true
+          };
           
-                 this.init().then(() => {
-  // Store global references after initialization
-  window.hostMeetingInstance = this;
-  window.myName = this.userName;
-  console.log('Host meeting initialized. Host name:', window.myName);
-});
+          this.init().then(() => {
+            // Store global references after initialization
+            window.joinMeetingInstance = this;
+            window.myName = this.userName;
+            console.log('Join meeting initialized. Participant name:', window.myName);
+          });
         }
 
         async init() {
@@ -636,10 +481,18 @@ class WebRTCManager {
         setupSocketListeners() {
           this.socket.on('joined-meeting', (data) => {
             console.log('Joined meeting as participant:', data);
+            if (data.permissions) {
+              this.meetingPermissions = data.permissions;
+              this.handlePermissionsUpdate();
+            }
             this.updateParticipants(data.participants);
-            this.spotlightedParticipant = data.spotlightedParticipant;
             this.updateMeetingTitle();
             this.updateRaisedHands(data.raisedHands);
+          });
+
+          this.socket.on('meeting-locked', (data) => {
+            console.log('Meeting is locked:', data);
+            this.showLockedModal(data.message);
           });
 
           this.socket.on('participant-joined', (data) => {
@@ -658,6 +511,14 @@ class WebRTCManager {
             this.webrtc.removePeerConnection(data.socketId);
           });
 
+          this.socket.on('meeting-ended', () => {
+            console.log('Meeting ended by host');
+            this.showToast('Meeting ended by host', 'info');
+            setTimeout(() => {
+              window.location.href = '/dashboard';
+            }, 2000);
+          });
+
           this.socket.on('participant-spotlighted', (data) => {
             console.log('Participant spotlighted:', data);
             this.handleSpotlightChange(data.spotlightedParticipant);
@@ -670,51 +531,44 @@ class WebRTCManager {
             this.updateParticipants(data.participants);
           });
 
-          this.socket.on('participant-pinned', (data) => {
-            console.log('Participant pinned:', data);
-            this.handlePinChange(data.pinnedParticipant);
-          });
-
-          this.socket.on('force-mute', (data) => {
-            console.log('Force muted:', data);
-            this.handleForceMute(data.isMuted);
-          });
-
-          this.socket.on('made-cohost', () => {
-            console.log('Made co-host');
-            this.isCoHost = true;
-            this.showToast('You are now a co-host!');
-            this.renderParticipants();
-            this.renderParticipantsList();
-          });
-
-          this.socket.on('kicked-from-meeting', () => {
-            console.log('Kicked from meeting');
-            document.getElementById('kickedModal').style.display = 'flex';
-          });
-
-          this.socket.on('meeting-ended', () => {
-            console.log('Meeting ended');
-            document.getElementById('meetingEndedModal').style.display = 'flex';
-          });
-
           this.socket.on('participant-muted', (data) => {
             console.log('Participant muted:', data);
             this.updateParticipantAudio(data.targetSocketId, data.isMuted);
             this.updateParticipants(data.participants);
           });
 
-          this.socket.on('meeting-error', (data) => {
-            console.error('Meeting error:', data);
-            this.showToast(data.message, 'error');
+          this.socket.on('force-mute', (data) => {
+            console.log('Force muted by host:', data);
+            if (data.isMuted) {
+              this.forceMute();
+              this.showToast('You have been muted by the host', 'info');
+            }
+          });
+
+          this.socket.on('made-cohost', () => {
+            console.log('Made co-host');
+            this.showToast('You are now a co-host!', 'success');
+          });
+
+          this.socket.on('kicked-from-meeting', () => {
+            console.log('Kicked from meeting');
+            this.showToast('You have been removed from the meeting', 'error');
             setTimeout(() => {
               window.location.href = '/dashboard';
-            }, 3000);
+            }, 2000);
           });
 
           this.socket.on('action-error', (data) => {
             console.error('Action error:', data);
             this.showToast(data.message, 'error');
+          });
+
+          // Permissions updated event
+          this.socket.on('permissions-updated', (data) => {
+            console.log('Permissions updated:', data);
+            this.meetingPermissions = data.permissions;
+            this.handlePermissionsUpdate();
+            this.showToast(`Meeting permissions updated by ${data.changedBy}`, 'info');
           });
 
           // Hand raised events
@@ -731,6 +585,35 @@ class WebRTCManager {
               this.reactionManager.updateHandRaised(data.socketId, data.participantName, false);
             }
           });
+        }
+
+        handlePermissionsUpdate() {
+          // Disable/enable chat functionality
+          if (window.chatInstance) {
+            if (!this.meetingPermissions.chatEnabled) {
+              window.chatInstance.disableChat();
+            } else {
+              window.chatInstance.enableChat();
+            }
+          }
+
+          // Disable/enable file sharing
+          if (window.fileShareInstance) {
+            if (!this.meetingPermissions.fileShareEnabled) {
+              window.fileShareInstance.disableFileShare();
+            } else {
+              window.fileShareInstance.enableFileShare();
+            }
+          }
+
+          // Disable/enable emoji reactions
+          if (this.reactionManager) {
+            if (!this.meetingPermissions.emojiReactionsEnabled) {
+              this.reactionManager.disableReactions();
+            } else {
+              this.reactionManager.enableReactions();
+            }
+          }
         }
 
         setupEventListeners() {
@@ -769,8 +652,13 @@ class WebRTCManager {
             this.toggleScreenShare(e.currentTarget);
           });
 
+          // Raise hand
+          document.getElementById('raiseHandBtn').addEventListener('click', (e) => {
+            this.toggleRaiseHand(e.currentTarget);
+          });
+
           // Leave call
-          document.getElementById('leaveCallBtn').addEventListener('click', () => {
+          document.getElementById('endCallBtn').addEventListener('click', () => {
             this.leaveMeeting();
           });
 
@@ -863,8 +751,6 @@ class WebRTCManager {
             statusIcons.push('<div class="status-icon camera-off"><i class="fas fa-video-slash"></i></div>');
           }
 
-          const dropdownOptions = this.getParticipantDropdownOptions(participant);
-
           item.innerHTML = `
             <div class="participant-avatar">${initials}</div>
             <div class="participant-info">
@@ -872,71 +758,14 @@ class WebRTCManager {
               <div class="participant-role">
                 <span class="role-badge ${roleClass}">${roleText}</span>
                 ${participant.isSpotlighted ? '<i class="fas fa-star" style="color: #fbbf24; margin-left: 4px;"></i>' : ''}
-                ${this.pinnedParticipant === participant.socketId ? '<i class="fas fa-thumbtack" style="color: #10b981; margin-left: 4px;"></i>' : ''}
               </div>
             </div>
             <div class="participant-status">
               ${statusIcons.join('')}
             </div>
-            <div class="participant-actions">
-              <button class="participant-menu-btn" data-participant-id="${participant.socketId}">
-                <i class="fas fa-ellipsis-v"></i>
-              </button>
-              <div class="participant-dropdown" id="dropdown-${participant.socketId}">
-                ${dropdownOptions}
-              </div>
-            </div>
           `;
 
-          // Bind events
-          const menuBtn = item.querySelector('.participant-menu-btn');
-          const dropdown = item.querySelector('.participant-dropdown');
-
-          menuBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            // Close all other dropdowns
-            document.querySelectorAll('.participant-dropdown').forEach(d => {
-              if (d !== dropdown) d.classList.remove('show');
-            });
-            dropdown.classList.toggle('show');
-          });
-
-          // Bind dropdown actions
-          const dropdownButtons = dropdown.querySelectorAll('button');
-          dropdownButtons.forEach(button => {
-            button.addEventListener('click', (e) => {
-              e.stopPropagation();
-              const action = button.dataset.action;
-              this.handleParticipantAction(action, participant.socketId);
-              dropdown.classList.remove('show');
-            });
-          });
-
           return item;
-        }
-
-        getParticipantDropdownOptions(participant) {
-          let options = [];
-          
-          // Pin option (available to all participants)
-          if (this.pinnedParticipant === participant.socketId) {
-            options.push('<button data-action="unpin"><i class="fas fa-thumbtack"></i> Unpin</button>');
-          } else {
-            options.push('<button data-action="pin"><i class="fas fa-thumbtack"></i> Pin</button>');
-          }
-          
-          // Co-host and host actions
-          if (this.isCoHost && !participant.isHost) {
-            if (participant.isSpotlighted) {
-              options.push('<button data-action="remove-spotlight"><i class="fas fa-star-half-alt"></i> Remove Spotlight</button>');
-            } else {
-              options.push('<button data-action="spotlight"><i class="fas fa-star"></i> Spotlight</button>');
-            }
-            
-            options.push(`<button data-action="mute"><i class="fas fa-microphone-slash"></i> ${participant.isMuted ? 'Unmute' : 'Mute'}</button>`);
-          }
-          
-          return options.join('');
         }
 
         joinMeeting() {
@@ -953,9 +782,6 @@ class WebRTCManager {
           this.participants.clear();
           participants.forEach(p => {
             this.participants.set(p.socketId, p);
-            if (p.socketId === this.socket.id) {
-              this.isCoHost = p.isCoHost;
-            }
           });
 
           // Ensure local participant is always present
@@ -983,12 +809,7 @@ class WebRTCManager {
           participantArray.forEach((participant, index) => {
             const videoWrapper = this.createVideoWrapper(participant);
             
-            // Check if this participant should be in main view
-            const shouldBeMain = (this.spotlightedParticipant === participant.socketId || 
-                                 this.pinnedParticipant === participant.socketId) && 
-                                 this.currentView === 'sidebar';
-            
-            if (shouldBeMain) {
+            if (participant.isSpotlighted && this.currentView === 'sidebar') {
               videoWrapper.classList.add('main-video');
               videoWrapper.setAttribute('data-main-video', 'true');
               mainVideoSection.appendChild(videoWrapper);
@@ -1003,27 +824,16 @@ class WebRTCManager {
           wrapper.className = 'video-wrapper';
           wrapper.dataset.socketId = participant.socketId;
           
-          if (participant.isSpotlighted || this.pinnedParticipant === participant.socketId) {
+          if (participant.isSpotlighted) {
             wrapper.setAttribute('data-main-video', 'true');
           }
-
-          const dropdownOptions = this.getDropdownOptions(participant);
           
           wrapper.innerHTML = `
             <video class="video-frame" autoplay playsinline ${participant.socketId === this.socket.id ? 'muted' : ''}></video>
-            <div class="video-controls">
-              <button class="menu-dots">⋮</button>
-              <div class="dropdown-menu">
-                ${dropdownOptions}
-              </div>
-            </div>
-            <div class="participant-name">${participant.name}${participant.isHost ? ' (Host)' : ''}${participant.isCoHost ? ' (Co-Host)'  : ''}</div>
+            <div class="participant-name">${participant.name}${participant.isHost ? ' (Host)' : ''}${participant.isCoHost ? ' (Co-Host)' : ''}</div>
             ${participant.isSpotlighted ? '<div class="spotlight-badge"><i class="fas fa-star"></i></div>' : ''}
-            ${this.pinnedParticipant === participant.socketId ? '<div class="pin-badge"><i class="fas fa-thumbtack"></i></div>' : ''}
             ${participant.isMuted ? '<div class="audio-indicator"><i class="fas fa-microphone-slash"></i></div>' : ''}
           `;
-
-          this.bindVideoWrapperEvents(wrapper, participant);
           
           // Attach video stream
           setTimeout(() => {
@@ -1049,100 +859,6 @@ class WebRTCManager {
           return wrapper;
         }
 
-        getDropdownOptions(participant) {
-          let options = [];
-          
-          // Pin option (available to all participants)
-          if (this.pinnedParticipant === participant.socketId) {
-            options.push('<button data-action="unpin">Unpin</button>');
-          } else {
-            options.push('<button data-action="pin">Pin</button>');
-          }
-          
-          // Co-host and host actions
-          if (this.isCoHost && !participant.isHost) {
-            if (participant.isSpotlighted) {
-              options.push('<button data-action="remove-spotlight">Remove Spotlight</button>');
-            } else {
-              options.push('<button data-action="spotlight">Spotlight</button>');
-            }
-            
-            options.push(`<button data-action="mute">${participant.isMuted ? 'Unmute' : 'Mute'} Participant</button>`);
-          }
-          
-          return options.join('');
-        }
-
-        bindVideoWrapperEvents(wrapper, participant) {
-          // Double click to pin
-          wrapper.addEventListener('dblclick', () => {
-            this.pinParticipant(participant.socketId);
-          });
-
-          // Dropdown menu actions
-          const dropdownButtons = wrapper.querySelectorAll('.dropdown-menu button');
-          dropdownButtons.forEach(button => {
-            button.addEventListener('click', (e) => {
-              e.stopPropagation();
-              const action = button.dataset.action;
-              this.handleParticipantAction(action, participant.socketId);
-            });
-          });
-        }
-
-        handleParticipantAction(action, socketId) {
-          switch(action) {
-            case 'pin':
-              this.pinParticipant(socketId);
-              break;
-            case 'unpin':
-              this.unpinParticipant();
-              break;
-            case 'spotlight':
-              this.spotlightParticipant(socketId);
-              break;
-            case 'remove-spotlight':
-              this.removeSpotlight();
-              break;
-            case 'mute':
-              this.muteParticipant(socketId);
-              break;
-          }
-        }
-
-        pinParticipant(socketId) {
-          this.pinnedParticipant = socketId;
-          this.socket.emit('pin-participant', { targetSocketId: socketId });
-          this.renderParticipants();
-          if (this.participantsPanelOpen) {
-            this.renderParticipantsList();
-          }
-          
-          const participant = this.participants.get(socketId);
-          this.showToast(`Pinned ${participant?.name || 'participant'}`);
-        }
-
-        unpinParticipant() {
-          this.pinnedParticipant = null;
-          this.renderParticipants();
-          if (this.participantsPanelOpen) {
-            this.renderParticipantsList();
-          }
-          this.showToast('Unpinned participant');
-        }
-
-        spotlightParticipant(socketId) {
-          this.socket.emit('spotlight-participant', { targetSocketId: socketId });
-        }
-
-        removeSpotlight() {
-          this.socket.emit('remove-spotlight');
-        }
-
-        muteParticipant(socketId) {
-          this.socket.emit('mute-participant', { targetSocketId: socketId });
-        }
-
         handleSpotlightChange(spotlightedSocketId) {
           this.spotlightedParticipant = spotlightedSocketId;
           this.renderParticipants();
@@ -1157,24 +873,6 @@ class WebRTCManager {
           if (this.participantsPanelOpen) {
             this.renderParticipantsList();
           }
-        }
-
-        handlePinChange(pinnedSocketId) {
-          this.pinnedParticipant = pinnedSocketId;
-          this.renderParticipants();
-          if (this.participantsPanelOpen) {
-            this.renderParticipantsList();
-          }
-        }
-
-        handleForceMute(isMuted) {
-          const micBtn = document.getElementById('micBtn');
-          micBtn.setAttribute('data-active', !isMuted);
-          
-          const icon = micBtn.querySelector('i');
-          icon.className = isMuted ? 'fas fa-microphone-slash' : 'fas fa-microphone';
-          
-          this.showToast(isMuted ? 'You have been muted by the host' : 'You have been unmuted by the host');
         }
 
         removeParticipantVideo(socketId) {
@@ -1200,6 +898,14 @@ class WebRTCManager {
               audioIndicator.remove();
             }
           }
+        }
+
+        forceMute() {
+          const micBtn = document.getElementById('micBtn');
+          micBtn.setAttribute('data-active', 'false');
+          const icon = micBtn.querySelector('i');
+          icon.className = 'fas fa-microphone-slash';
+          this.webrtc.toggleAudio(false);
         }
 
         toggleView() {
@@ -1265,6 +971,21 @@ class WebRTCManager {
           }
         }
 
+        toggleRaiseHand(button) {
+          const isActive = button.getAttribute('data-active') === 'true';
+          button.setAttribute('data-active', !isActive);
+          
+          const icon = button.querySelector('i');
+          if (isActive) {
+            icon.className = 'fas fa-hand-paper';
+            this.socket.emit('lower-hand');
+          } else {
+            icon.className = 'fas fa-hand-paper';
+            button.style.background = '#fbbf24';
+            this.socket.emit('raise-hand');
+          }
+        }
+
         updateParticipantCount() {
           const count = this.participants.size;
           document.getElementById('participantCount').textContent = count;
@@ -1285,6 +1006,27 @@ class WebRTCManager {
           timeElement.textContent = timeString;
           
           setTimeout(() => this.updateTime(), 60000);
+        }
+
+        showLockedModal(message) {
+          const modal = document.createElement('div');
+          modal.className = 'modal-overlay';
+          modal.innerHTML = `
+            <div class="modal-content">
+              <div class="modal-header">
+                <h3>Meeting Locked</h3>
+              </div>
+              <div class="modal-body">
+                <p>${message}</p>
+              </div>
+              <div class="modal-footer">
+                <button class="btn btn-primary" onclick="window.location.href='/dashboard'">
+                  Return to Dashboard
+                </button>
+              </div>
+            </div>
+          `;
+          document.body.appendChild(modal);
         }
 
         showToast(message, type = 'success') {
@@ -1309,109 +1051,22 @@ class WebRTCManager {
         }
       }
 
-      // Close dropdowns when clicking outside
-      document.addEventListener('click', () => {
-        document.querySelectorAll('.participant-dropdown').forEach(dropdown => {
-          dropdown.classList.remove('show');
-        });
-      });
-
-      // Initialize the participant meeting
+      // Initialize the join meeting
       document.addEventListener('DOMContentLoaded', () => {
-        new ParticipantMeeting();
+        new JoinMeeting();
       });
-      // Method 1: Add console logging to the existing HostMeeting class
-// Add this line in the constructor after meetingId is set:
-console.log('Meeting ID:', this.meetingId);
 
-// Method 2: Create a global function to access meeting ID
-// Add this after the HostMeeting class definition:
-window.getMeetingId = function() {
-  // Extract from URL (same logic as in the constructor)
-  const meetingId = window.location.pathname.split('/').pop();
-  console.log('Current Meeting ID:', meetingId);
-  return meetingId;
-};
+      // Make participant name globally accessible
+      var myName = null;
+      window.myName = null;
 
-// Method 3: Store the meeting instance globally for console access
-// Modify the DOMContentLoaded event listener:
-document.addEventListener('DOMContentLoaded', () => {
-  window.hostMeeting = new HostMeeting();
-  console.log('Host Meeting initialized. Meeting ID:', window.hostMeeting.meetingId);
-});
-
-// Method 4: Add a dedicated console command function
-window.showMeetingInfo = function() {
-  const meetingId = window.location.pathname.split('/').pop();
-  const joinUrl = `${window.location.origin}/join/${meetingId}`;
-  
-  console.group('📹 Meeting Information');
-  console.log('Meeting ID:', meetingId);
-  console.log('Join URL:', joinUrl);
-  console.log('Current URL:', window.location.href);
-  if (window.hostMeeting) {
-    console.log('Participants:', window.hostMeeting.participants.size);
-    console.log('Is Host:', window.hostMeeting.isHost);
-    console.log('User Name:', window.hostMeeting.userName);
-  }
-  console.groupEnd();
-  
-  return {
-    meetingId,
-    joinUrl,
-    currentUrl: window.location.href
-  };
-};
-
-// Method 5: Simple one-liner for immediate use
-// You can run this directly in the browser console:
-console.log('Meeting ID:', window.location.pathname.split('/').pop());
-
-// Method 6: Enhanced version with error handling
-window.getMeetingDetails = function() {
-  try {
-    const pathParts = window.location.pathname.split('/');
-    const meetingId = pathParts[pathParts.length - 1];
-    
-    if (!meetingId || meetingId === '') {
-      console.warn('No meeting ID found in URL');
-      return null;
-    }
-    
-    const details = {
-      meetingId: meetingId,
-      joinUrl: `${window.location.origin}/join/${meetingId}`,
-      hostUrl: window.location.href,
-      timestamp: new Date().toISOString()
-    };
-    
-    console.table(details);
-    return details;
-  } catch (error) {
-    console.error('Error getting meeting details:', error);
-    return null;
-  }
-};
-// Make host name globally accessible
-var myName = null;
-window.myName = null;
-
-// Store global reference when meeting initializes  
-window.addEventListener('load', function() {
-  setTimeout(() => {
-    // Try to find the host name from various sources
-    const participantItems = document.querySelectorAll('.participant-item');
-    for (let item of participantItems) {
-      const roleElement = item.querySelector('.role-badge');
-      if (roleElement && roleElement.textContent.includes('Host')) {
-        const nameElement = item.querySelector('.participant-name');
-        if (nameElement) {
-          myName = nameElement.textContent.trim();
-          window.myName = myName;
-          console.log('myName set to:', myName);
-          return;
-        }
-      }
-    }
-  }, 3000); // Wait 3 seconds for everything to load
-});
+      // Store global reference when meeting initializes  
+      window.addEventListener('load', function() {
+        setTimeout(() => {
+          if (window.joinMeetingInstance && window.joinMeetingInstance.userName) {
+            myName = window.joinMeetingInstance.userName;
+            window.myName = myName;
+            console.log('myName set to:', myName);
+          }
+        }, 3000);
+      });

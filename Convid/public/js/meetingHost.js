@@ -411,6 +411,12 @@
           this.participantsPanelOpen = false;
           this.searchTerm = '';
           this.reactionManager = null;
+          this.meetingPermissions = {
+            chatEnabled: true,
+            fileShareEnabled: true,
+            emojiReactionsEnabled: true,
+            privateMessagesEnabled: true
+          };
           
         this.init().then(() => {
   // Store global references after initialization
@@ -478,6 +484,10 @@
         setupSocketListeners() {
           this.socket.on('joined-meeting', (data) => {
             console.log('Joined meeting as host:', data);
+            if (data.permissions) {
+              this.meetingPermissions = data.permissions;
+              this.updatePermissionToggles();
+            }
             this.updateParticipants(data.participants);
             this.updateMeetingTitle();
             this.updateRaisedHands(data.raisedHands);
@@ -533,6 +543,14 @@
           this.socket.on('action-error', (data) => {
             console.error('Action error:', data);
             this.showToast(data.message, 'error');
+          });
+
+          // Permissions updated event
+          this.socket.on('permissions-updated', (data) => {
+            console.log('Permissions updated:', data);
+            this.meetingPermissions = data.permissions;
+            this.updatePermissionToggles();
+            this.showToast(`Meeting permissions updated by ${data.changedBy}`, 'info');
           });
 
           // Hand raised events
@@ -610,6 +628,9 @@
             this.copyToClipboard(joinUrl);
           });
 
+          // Permission toggle event listeners
+          this.setupPermissionToggles();
+
           // Close participants panel when clicking outside
           document.addEventListener('click', (e) => {
             if (this.participantsPanelOpen && 
@@ -627,6 +648,77 @@
               this.reactionManager.raisedHands.add(socketId);
             });
             this.reactionManager.updateParticipantsDisplay();
+          }
+        }
+
+        setupPermissionToggles() {
+          // Chat toggle
+          const chatToggle = document.querySelector('#chat .setting-item:nth-child(1) input[type="checkbox"]');
+          if (chatToggle) {
+            chatToggle.addEventListener('change', () => {
+              this.updatePermission('chatEnabled', chatToggle.checked);
+            });
+          }
+
+          // File sharing toggle
+          const fileShareToggle = document.querySelector('#chat .setting-item:nth-child(3) input[type="checkbox"]');
+          if (fileShareToggle) {
+            fileShareToggle.addEventListener('change', () => {
+              this.updatePermission('fileShareEnabled', fileShareToggle.checked);
+            });
+          }
+
+          // Emoji reactions toggle
+          const emojiToggle = document.querySelector('#chat .setting-item:nth-child(4) input[type="checkbox"]');
+          if (emojiToggle) {
+            emojiToggle.addEventListener('change', () => {
+              this.updatePermission('emojiReactionsEnabled', emojiToggle.checked);
+            });
+          }
+
+          // Private messages toggle (if visible)
+          const privateToggle = document.querySelector('#chat .setting-item:nth-child(2) input[type="checkbox"]');
+          if (privateToggle) {
+            privateToggle.addEventListener('change', () => {
+              this.updatePermission('privateMessagesEnabled', privateToggle.checked);
+            });
+          }
+        }
+
+        updatePermission(permissionKey, value) {
+          this.meetingPermissions[permissionKey] = value;
+          
+          // Send update to server
+          this.socket.emit('update-meeting-permissions', {
+            permissions: { [permissionKey]: value }
+          });
+          
+          console.log(`Updated ${permissionKey} to ${value}`);
+        }
+
+        updatePermissionToggles() {
+          // Update chat toggle
+          const chatToggle = document.querySelector('#chat .setting-item:nth-child(1) input[type="checkbox"]');
+          if (chatToggle) {
+            chatToggle.checked = this.meetingPermissions.chatEnabled;
+          }
+
+          // Update file sharing toggle
+          const fileShareToggle = document.querySelector('#chat .setting-item:nth-child(3) input[type="checkbox"]');
+          if (fileShareToggle) {
+            fileShareToggle.checked = this.meetingPermissions.fileShareEnabled;
+          }
+
+          // Update emoji reactions toggle
+          const emojiToggle = document.querySelector('#chat .setting-item:nth-child(4) input[type="checkbox"]');
+          if (emojiToggle) {
+            emojiToggle.checked = this.meetingPermissions.emojiReactionsEnabled;
+          }
+
+          // Update private messages toggle (if visible)
+          const privateToggle = document.querySelector('#chat .setting-item:nth-child(2) input[type="checkbox"]');
+          if (privateToggle) {
+            privateToggle.checked = this.meetingPermissions.privateMessagesEnabled;
           }
         }
 

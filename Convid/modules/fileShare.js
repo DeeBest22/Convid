@@ -439,11 +439,7 @@ export const setupSocketIO = (server) => {
         screenShares: Array.from(meeting.screenShares.entries()),
         raisedHands: meeting.getRaisedHands(),
         iceServers: meeting.iceServers,
-                if (meeting && !meeting.permissions.fileShareEnabled) {
-                    return res.status(403).json({ error: 'File sharing is disabled by the host' });
-                }
-            }
-            
+        permissions: meeting.getPermissions(),
         isLocked: meeting.isLocked
       });
 

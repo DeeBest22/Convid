@@ -438,13 +438,6 @@ export const setupSocketIO = (server) => {
         spotlightedParticipant: meeting.spotlightedParticipant,
         screenShares: Array.from(meeting.screenShares.entries()),
         raisedHands: meeting.getRaisedHands(),
-        
-        if (meeting && !meeting.permissions.chatEnabled) {
-          socket.emit('action-error', { message: 'Chat is disabled by the host' });
-          return;
-        }
-      }
-      
         iceServers: meeting.iceServers,
         isLocked: meeting.isLocked
       });
@@ -459,18 +452,6 @@ export const setupSocketIO = (server) => {
 
     // New socket event for locking/unlocking meeting
     socket.on('toggle-meeting-lock', (data) => {
-      // Get meeting info to check permissions
-      const meetingId = data.meetingId;
-      if (meetingId) {
-        const { getMeeting } = require('./call.js');
-        const meeting = getMeeting(meetingId);
-        
-        if (meeting && !meeting.permissions.fileShareEnabled) {
-          socket.emit('action-error', { message: 'File sharing is disabled by the host' });
-          return;
-        }
-      }
-      
       const { isLocked } = data;
       const participantInfo = participants.get(socket.id);
       
@@ -602,6 +583,44 @@ export const setupSocketIO = (server) => {
           reason: 'audio-activity'
         });
       }
+    });
+
+    // Send media messages
+    socket.on('sendMedia', (data) => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (meeting && !meeting.permissions.chatEnabled) {
+        socket.emit('action-error', { message: 'Chat is disabled by the host' });
+        return;
+      }
+      
+      const senderName = users[socket.id];
+      const messageData = {
+        id: uuidv4(),
+        sender: senderName,
+        senderId: socket.id,
+        type: data.type,
+        content: data.content,
+        timestamp: new Date().toISOString(),
+        fileName: data.fileName,
+        fileSize: data.fileSize,
+        mimeType: data.mimeType
+      };
+
+      // Check if meeting exists and file sharing is enabled
+      const meetingId = data.meetingId;
+      if (meetingId) {
+        const meeting = meetings.get(meetingId);
+        
+        if (meeting && !meeting.permissions.fileShareEnabled) {
+          socket.emit('action-error', { message: 'File sharing is disabled by the host' });
+          return;
+        }
+      }
+
+      io.to(participantInfo.meetingId).emit('mediaMessage', messageData);
     });
 
     socket.on('send-reaction', (data) => {

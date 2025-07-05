@@ -25,6 +25,14 @@ class Meeting {
     this.raisedHands = new Set();
     this.iceServers = this.getICEServers();
     this.isLocked = false; // New property for meeting lock status
+    
+    // Meeting permissions
+    this.permissions = {
+      chatEnabled: true,
+      fileShareEnabled: true,
+      emojiReactionsEnabled: true,
+      privateMessagesEnabled: true
+    };
   }
 
   getICEServers() {
@@ -253,6 +261,15 @@ class Meeting {
     // Allow if meeting is not locked or if participant is already in the meeting
     return !this.isLocked || this.participants.has(socketId);
   }
+
+  // New methods for permission management
+  updatePermissions(newPermissions) {
+    this.permissions = { ...this.permissions, ...newPermissions };
+  }
+
+  getPermissions() {
+    return this.permissions;
+  }
 }
 
 // Store meeting data
@@ -359,6 +376,18 @@ export const setupSocketIO = (server) => {
       res.json({ iceServers });
     });
   };
+    // Meeting permissions endpoint
+    app.get('/api/meeting-permissions/:meetingId', authenticateUser, (req, res) => {
+      const { meetingId } = req.params;
+      const meeting = meetings.get(meetingId);
+      
+      if (!meeting) {
+        return res.status(404).json({ error: 'Meeting not found' });
+      }
+
+      res.json(meeting.getPermissions());
+    });
+
 
   // Socket.IO connection handling
   io.on('connection', (socket) => {
@@ -383,7 +412,8 @@ export const setupSocketIO = (server) => {
         spotlightedParticipant: meeting.spotlightedParticipant,
         raisedHands: meeting.getRaisedHands(),
         iceServers: meeting.iceServers,
-        isLocked: meeting.isLocked
+        isLocked: meeting.isLocked,
+        permissions: meeting.getPermissions()
       });
 
       console.log(`Host ${hostName} created meeting ${meetingId}`);
@@ -421,7 +451,8 @@ export const setupSocketIO = (server) => {
         screenShares: Array.from(meeting.screenShares.entries()),
         raisedHands: meeting.getRaisedHands(),
         iceServers: meeting.iceServers,
-        isLocked: meeting.isLocked
+        isLocked: meeting.isLocked,
+        permissions: meeting.getPermissions()
       });
 
       socket.to(meetingId).emit('participant-joined', {
@@ -458,6 +489,30 @@ export const setupSocketIO = (server) => {
       });
 
       console.log(`Meeting ${participantInfo.meetingId} ${isLocked ? 'locked' : 'unlocked'} by ${socket.id}`);
+    });
+
+    // New socket event for updating meeting permissions
+    socket.on('update-meeting-permissions', (data) => {
+      const { permissions } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Only host can change meeting permissions' });
+        return;
+      }
+
+      meeting.updatePermissions(permissions);
+
+      // Notify all participants about the permission changes
+      io.to(participantInfo.meetingId).emit('permissions-updated', {
+        permissions: meeting.getPermissions(),
+        changedBy: meeting.participants.get(socket.id)?.name
+      });
+
+      console.log(`Meeting permissions updated in ${participantInfo.meetingId} by ${socket.id}:`, permissions);
     });
 
     socket.on('participant-ready', () => {
@@ -573,6 +628,12 @@ export const setupSocketIO = (server) => {
 
       const meeting = meetings.get(participantInfo.meetingId);
       if (!meeting) return;
+
+      // Check if emoji reactions are enabled
+      if (!meeting.permissions.emojiReactionsEnabled) {
+        socket.emit('action-error', { message: 'Emoji reactions are disabled by the host' });
+        return;
+      }
 
       const participant = meeting.participants.get(socket.id);
       if (!participant) return;
@@ -889,4 +950,9 @@ export const setupSocketIO = (server) => {
   });
 
   return { io, setupMeetingRoutes };
+};
+
+// Export function to get meeting by ID (for use by other modules)
+export const getMeeting = (meetingId) => {
+  return meetings.get(meetingId);
 };

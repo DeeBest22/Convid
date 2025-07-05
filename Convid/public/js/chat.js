@@ -16,6 +16,14 @@ export const setupChat = (app, io) => {
     allowGroupCreation: true
   };
 
+  // Add method to check meeting permissions
+  const checkMeetingPermissions = (meetingId) => {
+    // This will be called from the frontend to check permissions
+    return fetch(`/api/meeting-permissions/${meetingId}`)
+      .then(res => res.json())
+      .catch(() => ({ chatEnabled: true, fileShareEnabled: true, emojiReactionsEnabled: true }));
+  };
+
   // Create uploads directory
   const uploadsDir = path.join(process.cwd(), 'public/uploads');
   if (!fs.existsSync(uploadsDir)) {
