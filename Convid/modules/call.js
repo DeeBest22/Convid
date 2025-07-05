@@ -25,14 +25,6 @@ class Meeting {
     this.raisedHands = new Set();
     this.iceServers = this.getICEServers();
     this.isLocked = false; // New property for meeting lock status
-    
-    // Meeting permissions
-    this.permissions = {
-      chatEnabled: true,
-      fileShareEnabled: true,
-      emojiReactionsEnabled: true,
-      privateMessagesEnabled: true
-    };
   }
 
   getICEServers() {
@@ -261,15 +253,6 @@ class Meeting {
     // Allow if meeting is not locked or if participant is already in the meeting
     return !this.isLocked || this.participants.has(socketId);
   }
-
-  // New methods for permission management
-  updatePermissions(newPermissions) {
-    this.permissions = { ...this.permissions, ...newPermissions };
-  }
-
-  getPermissions() {
-    return this.permissions;
-  }
 }
 
 // Store meeting data
@@ -400,8 +383,7 @@ export const setupSocketIO = (server) => {
         spotlightedParticipant: meeting.spotlightedParticipant,
         raisedHands: meeting.getRaisedHands(),
         iceServers: meeting.iceServers,
-        isLocked: meeting.isLocked,
-        permissions: meeting.getPermissions()
+        isLocked: meeting.isLocked
       });
 
       console.log(`Host ${hostName} created meeting ${meetingId}`);
