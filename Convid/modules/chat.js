@@ -1,331 +1,929 @@
-import multer from 'multer';
-import fs from 'fs';
+import { Server as SocketIO } from 'socket.io';
+import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
-import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { authenticateUser } from './auth.js';
 
+// Fix for __dirname in ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-export const setupChat = (app, io) => {
-  // Configuration
-  let config = {
-    chatEnabled: true,
-    generalOnly: false,
-    allowGroupCreation: true
-  };
-
-  // Create uploads directory
-  const uploadsDir = path.join(process.cwd(), 'public/uploads');
-  if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
+// Meeting class to manage meeting state
+class Meeting {
+  constructor(id, hostId, hostName) {
+    this.id = id;
+    this.hostId = hostId;
+    this.hostName = hostName;
+    this.participants = new Map();
+    this.coHosts = new Set();
+    this.spotlightedParticipant = null;
+    this.screenShares = new Map();
+    this.createdAt = new Date();
+    this.autoSpotlightEnabled = true;
+    this.manualSpotlight = false;
+    this.raisedHands = new Set();
+    this.iceServers = this.getICEServers();
+    this.isLocked = false; // New property for meeting lock status
+    
+    // Meeting permissions
+    this.permissions = {
+      chatEnabled: true,
+      fileShareEnabled: true,
+      emojiReactionsEnabled: true,
+      privateMessagesEnabled: true
+    };
   }
 
-  app.use('/uploads', express.static(uploadsDir));
-
-  // Multer setup for file uploads
-  const storage = multer.diskStorage({
-    destination: (req, file, cb) => { cb(null, uploadsDir); },
-    filename: (req, file, cb) => { cb(null, Date.now() + '-' + file.originalname); }
-  });
-  const upload = multer({ storage });
-
-  // File upload endpoint
-  app.post('/upload', upload.single('file'), (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const fileUrl = `/uploads/${req.file.filename}`;
-    const filename = req.file.originalname;
-    res.json({ fileUrl, filename });
-  });
-
-  // Configuration endpoints
-  app.post('/update-chat-toggle', (req, res) => {
-    config.chatEnabled = !req.body.disabled;
-    io.emit('configChanged', config);
-    res.sendStatus(200);
-  });
-
-  app.get('/get-chat-toggle', (req, res) => {
-    res.json({ disabled: !config.chatEnabled });
-  });
-
-  // In-memory storage
-  let users = {};
-  let groups = {};
-
-  // Chat socket handlers
-  const setupChatSocketHandlers = (socket) => {
-    socket.emit('existingGroups', Object.values(groups));
-    socket.emit('configChanged', config);
-
-    socket.on('register', (name) => {
-      users[socket.id] = name;
-      io.emit('updateUsers', users);
-    });
-
-    // Update configuration
-    socket.on('updateConfig', (newConfig) => {
-      config = { ...config, ...newConfig };
-      io.emit('configChanged', config);
-    });
-
-    // Send text messages
-    socket.on('sendMessage', (data) => {
-      const senderName = users[socket.id];
-      if (data.to === 'general') {
-        io.emit('receiveGeneralMessage', { 
-          id: data.id, 
-          from: senderName, 
-          fromSocketId: socket.id,
-          message: data.message, 
-          type: 'text',
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        const messageData = {
-          id: data.id, 
-          from: senderName, 
-          fromSocketId: socket.id, 
-          to: data.to,
-          message: data.message, 
-          type: 'text',
-          timestamp: new Date().toISOString()
-        };
-        
-        // Send to recipient only
-        io.to(data.to).emit('receivePrivateMessage', messageData);
-        // Send back to sender with a different event to avoid duplication
-        socket.emit('privateMessageSent', messageData);
-      }
-    });
-
-    // Delete message
-    socket.on('deleteMessage', (data) => {
-      if (data.to === 'general') {
-        io.emit('messageDeleted', { id: data.id, chat: 'general' });
-      } else if (data.to.startsWith("group-")) {
-        let group = groups[data.to];
-        if (group) {
-          group.members.forEach(memberId => {
-            io.to(memberId).emit('messageDeleted', { id: data.id, chat: data.to });
-          });
-        }
-      } else {
-        const parts = data.to.split("-");
-        io.to(parts[0]).emit('messageDeleted', { id: data.id, chat: data.to });
-        io.to(parts[1]).emit('messageDeleted', { id: data.id, chat: data.to });
-      }
-    });
-
-    // Send media messages
-    socket.on('sendMedia', (data) => {
-      const senderName = users[socket.id];
-      const messageData = { 
-        id: data.id, 
-        from: senderName, 
-        message: data.fileUrl, 
-        type: data.fileType, 
-        filename: data.filename,
-        timestamp: new Date().toISOString()
-      };
-
-      if (data.to === 'general') {
-        messageData.fromSocketId = socket.id;
-        io.emit('receiveGeneralMessage', messageData);
-      } else {
-        messageData.fromSocketId = socket.id;
-        messageData.to = data.to;
-        // Send to recipient only
-        io.to(data.to).emit('receivePrivateMessage', messageData);
-        // Send back to sender with different event
-        socket.emit('privateMessageSent', messageData);
-      }
-    });
-
-    // Edit message
-    socket.on('editMessage', (data) => {
-      const senderName = users[socket.id];
-      const editedData = { 
-        id: data.id, 
-        from: senderName, 
-        newMessage: data.newMessage, 
-        edited: true, 
-        type: 'text',
-        timestamp: new Date().toISOString()
-      };
-
-      if (data.to === 'general') {
-        io.emit('messageEdited', { ...editedData, chat: 'general' });
-      } else if (data.to.startsWith("group-")) {
-        let group = groups[data.to];
-        if (group) {
-          group.members.forEach(member => {
-            io.to(member).emit('messageEdited', { ...editedData, chat: data.to });
-          });
-        }
-      } else {
-        const parts = data.to.split("-");
-        io.to(parts[0]).emit('messageEdited', { ...editedData, chat: data.to });
-        io.to(parts[1]).emit('messageEdited', { ...editedData, chat: data.to });
-      }
-    });
-
-    // Typing indicators
-    socket.on('typing', (data) => {
-      if (data.to === 'general') {
-        socket.broadcast.emit('displayTyping', { 
-          from: users[socket.id], 
-          conversation: 'general', 
-          socketId: socket.id 
-        });
-      } else if (data.to.startsWith("group-")) {
-        let group = groups[data.to];
-        if (group) {
-          group.members.forEach(member => {
-            if (member !== socket.id) {
-              io.to(member).emit('displayTyping', { 
-                from: users[socket.id], 
-                conversation: data.to, 
-                socketId: socket.id 
-              });
-            }
-          });
-        }
-      } else {
-        io.to(data.to).emit('displayTyping', { 
-          from: users[socket.id], 
-          conversation: data.conversation, 
-          socketId: socket.id 
-        });
-      }
-    });
-
-    socket.on('stopTyping', (data) => {
-      if (data.to === 'general') {
-        socket.broadcast.emit('removeTyping', { 
-          from: users[socket.id], 
-          conversation: 'general', 
-          socketId: socket.id 
-        });
-      } else if (data.to.startsWith("group-")) {
-        let group = groups[data.to];
-        if (group) {
-          group.members.forEach(member => {
-            if (member !== socket.id) {
-              io.to(member).emit('removeTyping', { 
-                from: users[socket.id], 
-                conversation: data.to, 
-                socketId: socket.id 
-              });
-            }
-          });
-        }
-      } else {
-        const parts = data.conversation.split("-");
-        io.to(parts[0]).emit('removeTyping', { 
-          from: users[socket.id], 
-          conversation: data.conversation, 
-          socketId: socket.id 
-        });
-        io.to(parts[1]).emit('removeTyping', { 
-          from: users[socket.id], 
-          conversation: data.conversation, 
-          socketId: socket.id 
-        });
-      }
-    });
-
-    // Group events
-    socket.on('createGroup', (data) => {
-      const groupId = 'group-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
-      const group = {
-        id: groupId,
-        host: socket.id,
-        hostName: users[socket.id],
-        name: data.groupName,
-        open: data.open,
-        members: [socket.id]
-      };
-      groups[groupId] = group;
+  getICEServers() {
+    // Enhanced ICE servers configuration for production
+    const iceServers = [
+      // Google STUN servers
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
       
-      // Emit to all users so they can see the new group
-      io.emit('groupCreated', group);
-    });
-
-    socket.on('requestJoinGroup', (data) => {
-      const group = groups[data.groupId];
-      if (group) {
-        if (group.open) {
-          // For open groups, automatically add the user
-          if (!group.members.includes(socket.id)) {
-            group.members.push(socket.id);
-          }
-          socket.emit('joinedGroup', group);
-          io.emit('groupUpdated', group);
-        } else {
-          // For private groups, send request to host
-          io.to(group.host).emit('joinGroupRequest', { 
-            groupId: data.groupId, 
-            requesterId: socket.id, 
-            requesterName: users[socket.id] 
-          });
-        }
-      }
-    });
-
-    socket.on('acceptJoinGroup', (data) => {
-      const group = groups[data.groupId];
-      if (group && group.host === socket.id) {
-        if (!group.members.includes(data.requesterId)) {
-          group.members.push(data.requesterId);
-        }
-        io.to(data.requesterId).emit('joinedGroup', group);
-        io.emit('groupUpdated', group);
-      }
-    });
-
-    socket.on('sendGroupMessage', (data) => {
-      const group = groups[data.groupId];
-      if (group && group.members.includes(socket.id)) {
-        const senderName = users[socket.id];
-        const msg = { 
-          id: data.id, 
-          from: senderName, 
-          fromSocketId: socket.id,
-          message: data.message, 
-          type: data.type || 'text', 
-          groupId: data.groupId,
-          timestamp: new Date().toISOString()
-        };
-        
-        // Send to all group members
-        group.members.forEach(member => {
-          io.to(member).emit('receiveGroupMessage', msg);
-        });
-      }
-    });
-
-    // Chat cleanup on disconnect
-    const handleChatDisconnect = () => {
-      delete users[socket.id];
-      io.emit('updateUsers', users);
+      // Additional STUN servers for better connectivity
+      { urls: 'stun:stun.stunprotocol.org:3478' },
+      { urls: 'stun:stun.voiparound.com' },
+      { urls: 'stun:stun.voipbuster.com' },
+      { urls: 'stun:stun.voipstunt.com' },
+      { urls: 'stun:stun.voxgratia.org' },
       
-      // Clean up groups
-      for (let groupId in groups) {
-        const group = groups[groupId];
-        group.members = group.members.filter(id => id !== socket.id);
-        if (group.host === socket.id) {
-          delete groups[groupId];
-          io.emit('groupDeleted', { groupId });
-        } else if (group.members.length > 0) {
-          io.emit('groupUpdated', group);
-        }
+      // OpenRelay TURN servers (free but limited)
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
       }
+    ];
+
+    // Add environment-based TURN servers if available
+    if (process.env.TURN_SERVER_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+      iceServers.push({
+        urls: process.env.TURN_SERVER_URL,
+        username: process.env.TURN_USERNAME,
+        credential: process.env.TURN_CREDENTIAL
+      });
+    }
+
+    return iceServers;
+  }
+
+  addParticipant(socketId, name, isHost = false) {
+    const participant = {
+      socketId,
+      name,
+      isHost,
+      isCoHost: false,
+      isMuted: false,
+      isCameraOff: false,
+      isSpotlighted: false,
+      isScreenSharing: false,
+      audioLevel: 0,
+      joinedAt: new Date(),
+      isReady: false,
+      handRaised: false,
+      connectionState: 'new'
     };
+    
+    this.participants.set(socketId, participant);
+    
+    if (isHost && !this.spotlightedParticipant) {
+      this.spotlightParticipant(socketId);
+    }
+    
+    return participant;
+  }
 
-    return { handleChatDisconnect };
+  removeParticipant(socketId) {
+    this.participants.delete(socketId);
+    this.coHosts.delete(socketId);
+    this.screenShares.delete(socketId);
+    this.raisedHands.delete(socketId);
+    
+    if (this.spotlightedParticipant === socketId) {
+      this.spotlightedParticipant = null;
+      this.manualSpotlight = false;
+    }
+  }
+
+  setParticipantReady(socketId) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isReady = true;
+      participant.connectionState = 'ready';
+    }
+  }
+
+  updateParticipantConnectionState(socketId, state) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.connectionState = state;
+    }
+  }
+
+  getReadyParticipants() {
+    return Array.from(this.participants.values()).filter(p => p.isReady);
+  }
+
+  makeCoHost(socketId) {
+    const participant = this.participants.get(socketId);
+    if (participant && !participant.isHost) {
+      participant.isCoHost = true;
+      this.coHosts.add(socketId);
+    }
+  }
+
+  removeCoHost(socketId) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isCoHost = false;
+      this.coHosts.delete(socketId);
+    }
+  }
+
+  spotlightParticipant(socketId) {
+    if (this.spotlightedParticipant) {
+      const prevSpotlighted = this.participants.get(this.spotlightedParticipant);
+      if (prevSpotlighted) {
+        prevSpotlighted.isSpotlighted = false;
+      }
+    }
+
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isSpotlighted = true;
+      this.spotlightedParticipant = socketId;
+      this.manualSpotlight = true;
+    }
+  }
+
+  removeSpotlight() {
+    if (this.spotlightedParticipant) {
+      const participant = this.participants.get(this.spotlightedParticipant);
+      if (participant) {
+        participant.isSpotlighted = false;
+      }
+      this.spotlightedParticipant = null;
+      this.manualSpotlight = false;
+    }
+  }
+
+  handleAudioActivity(socketId, audioLevel) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.audioLevel = audioLevel;
+      
+      if (!this.manualSpotlight && this.autoSpotlightEnabled && audioLevel > 0.3) {
+        if (this.spotlightedParticipant !== socketId) {
+          this.spotlightParticipant(socketId);
+          this.manualSpotlight = false;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  addScreenShare(socketId, streamId) {
+    this.screenShares.set(socketId, {
+      streamId,
+      startedAt: new Date()
+    });
+    
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isScreenSharing = true;
+    }
+  }
+
+  removeScreenShare(socketId) {
+    this.screenShares.delete(socketId);
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isScreenSharing = false;
+    }
+  }
+
+  raiseHand(socketId) {
+    this.raisedHands.add(socketId);
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.handRaised = true;
+    }
+  }
+
+  lowerHand(socketId) {
+    this.raisedHands.delete(socketId);
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.handRaised = false;
+    }
+  }
+
+  getRaisedHands() {
+    return Array.from(this.raisedHands);
+  }
+
+  canPerformHostAction(socketId) {
+    const participant = this.participants.get(socketId);
+    return participant && (participant.isHost || participant.isCoHost);
+  }
+
+  canMakeCoHost(socketId) {
+    const participant = this.participants.get(socketId);
+    return participant && participant.isHost;
+  }
+
+  // New methods for meeting lock functionality
+  lockMeeting() {
+    this.isLocked = true;
+  }
+
+  unlockMeeting() {
+    this.isLocked = false;
+  }
+
+  isParticipantAllowed(socketId) {
+    // Allow if meeting is not locked or if participant is already in the meeting
+    return !this.isLocked || this.participants.has(socketId);
+  }
+
+  // New methods for permission management
+  updatePermissions(newPermissions) {
+    this.permissions = { ...this.permissions, ...newPermissions };
+  }
+
+  getPermissions() {
+    return this.permissions;
+  }
+}
+
+// Store meeting data
+const meetings = new Map();
+const participants = new Map();
+
+export const setupSocketIO = (server) => {
+  const io = new SocketIO(server, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"]
+    },
+    transports: ['websocket', 'polling'],
+    pingTimeout: 60000,
+    pingInterval: 25000
+  });
+
+  // Meeting routes
+  const setupMeetingRoutes = (app) => {
+    app.get('/host/:meetingId', authenticateUser, (req, res) => {
+      res.sendFile(path.join(__dirname, '../public', 'meetingHost.html'));
+    });
+
+    app.get('/join/:meetingId', authenticateUser, (req, res) => {
+      const { meetingId } = req.params;
+      const meeting = meetings.get(meetingId);
+      
+      // Check if meeting exists and is locked
+      if (meeting && meeting.isLocked) {
+        // Return a special locked page instead of the normal join page
+        res.sendFile(path.join(__dirname, '../public', 'meetingLocked.html'));
+        return;
+      }
+      
+      res.sendFile(path.join(__dirname, '../public', 'meetingJoin.html'));
+    });
+
+    app.post('/api/create-meeting', authenticateUser, (req, res) => {
+      const meetingId = uuidv4().substring(0, 8).toUpperCase();
+      
+      res.json({ 
+        meetingId,
+        hostUrl: `/host/${meetingId}`,
+        joinUrl: `/join/${meetingId}`
+      });
+    });
+
+    app.get('/api/meeting/:meetingId', authenticateUser, (req, res) => {
+      const { meetingId } = req.params;
+      const meeting = meetings.get(meetingId);
+      
+      if (!meeting) {
+        return res.status(404).json({ error: 'Meeting not found' });
+      }
+
+      res.json({
+        id: meeting.id,
+        hostName: meeting.hostName,
+        participantCount: meeting.participants.size,
+        createdAt: meeting.createdAt,
+        isLocked: meeting.isLocked
+      });
+    });
+
+    // ICE servers endpoint for clients
+    app.get('/api/ice-servers', authenticateUser, (req, res) => {
+      const iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+        { urls: 'stun:stun.stunprotocol.org:3478' },
+        { urls: 'stun:stun.voiparound.com' },
+        { urls: 'stun:stun.voipbuster.com' },
+        { urls: 'stun:stun.voipstunt.com' },
+        { urls: 'stun:stun.voxgratia.org' },
+        {
+          urls: 'turn:openrelay.metered.ca:80',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        }
+      ];
+
+      // Add environment-based TURN servers if available
+      if (process.env.TURN_SERVER_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+        iceServers.push({
+          urls: process.env.TURN_SERVER_URL,
+          username: process.env.TURN_USERNAME,
+          credential: process.env.TURN_CREDENTIAL
+        });
+      }
+
+      res.json({ iceServers });
+    });
   };
 
-  return { setupChatSocketHandlers, config };
+  // Socket.IO connection handling
+  io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
+
+    socket.on('join-as-host', (data) => {
+      const { meetingId, hostName } = data;
+      
+      const meeting = new Meeting(meetingId, socket.id, hostName);
+      meetings.set(meetingId, meeting);
+      
+      meeting.addParticipant(socket.id, hostName, true);
+      
+      socket.join(meetingId);
+      
+      participants.set(socket.id, { meetingId, isHost: true });
+      
+      socket.emit('joined-meeting', {
+        meetingId,
+        isHost: true,
+        participants: Array.from(meeting.participants.values()),
+        spotlightedParticipant: meeting.spotlightedParticipant,
+        raisedHands: meeting.getRaisedHands(),
+        iceServers: meeting.iceServers,
+        isLocked: meeting.isLocked,
+        permissions: meeting.getPermissions()
+      });
+
+      console.log(`Host ${hostName} created meeting ${meetingId}`);
+    });
+
+    socket.on('join-meeting', (data) => {
+      const { meetingId, participantName } = data;
+      const meeting = meetings.get(meetingId);
+      
+      if (!meeting) {
+        socket.emit('meeting-error', { message: 'Meeting not found' });
+        return;
+      }
+
+      // Check if meeting is locked and participant is not already in the meeting
+      if (meeting.isLocked && !meeting.participants.has(socket.id)) {
+        socket.emit('meeting-locked', { 
+          message: 'The host disabled New Entries, Meeting Inaccessible',
+          meetingId: meetingId
+        });
+        return;
+      }
+
+      meeting.addParticipant(socket.id, participantName);
+      
+      socket.join(meetingId);
+      
+      participants.set(socket.id, { meetingId, isHost: false });
+      
+      socket.emit('joined-meeting', {
+        meetingId,
+        isHost: false,
+        participants: Array.from(meeting.participants.values()),
+        spotlightedParticipant: meeting.spotlightedParticipant,
+        screenShares: Array.from(meeting.screenShares.entries()),
+        raisedHands: meeting.getRaisedHands(),
+        
+        if (meeting && !meeting.permissions.chatEnabled) {
+          socket.emit('action-error', { message: 'Chat is disabled by the host' });
+          return;
+        }
+      }
+      
+        iceServers: meeting.iceServers,
+        isLocked: meeting.isLocked
+      });
+
+      socket.to(meetingId).emit('participant-joined', {
+        participant: meeting.participants.get(socket.id),
+        participants: Array.from(meeting.participants.values())
+      });
+
+      console.log(`Participant ${participantName} joined meeting ${meetingId}`);
+    });
+
+    // New socket event for locking/unlocking meeting
+    socket.on('toggle-meeting-lock', (data) => {
+      // Get meeting info to check permissions
+      const meetingId = data.meetingId;
+      if (meetingId) {
+        const { getMeeting } = require('./call.js');
+        const meeting = getMeeting(meetingId);
+        
+        if (meeting && !meeting.permissions.fileShareEnabled) {
+          socket.emit('action-error', { message: 'File sharing is disabled by the host' });
+          return;
+        }
+      }
+      
+      const { isLocked } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Only host can lock/unlock the meeting' });
+        return;
+      }
+
+      if (isLocked) {
+        meeting.lockMeeting();
+      } else {
+        meeting.unlockMeeting();
+      }
+
+      // Notify all participants about the lock status change
+      io.to(participantInfo.meetingId).emit('meeting-lock-changed', {
+        isLocked: meeting.isLocked,
+        changedBy: meeting.participants.get(socket.id)?.name
+      });
+
+      console.log(`Meeting ${participantInfo.meetingId} ${isLocked ? 'locked' : 'unlocked'} by ${socket.id}`);
+    });
+
+    socket.on('participant-ready', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.setParticipantReady(socket.id);
+      
+      const readyParticipants = meeting.getReadyParticipants();
+      
+      // Create connections with all ready participants
+      readyParticipants.forEach(participant => {
+        if (participant.socketId !== socket.id) {
+          // Send connection initiation to both parties
+          io.to(participant.socketId).emit('initiate-connection', {
+            targetSocketId: socket.id,
+            shouldCreateOffer: true,
+            iceServers: meeting.iceServers
+          });
+          
+          socket.emit('initiate-connection', {
+            targetSocketId: participant.socketId,
+            shouldCreateOffer: false,
+            iceServers: meeting.iceServers
+          });
+        }
+      });
+
+      console.log(`Participant ${socket.id} is ready for WebRTC connections`);
+    });
+
+    socket.on('connection-state-change', (data) => {
+      const { targetSocketId, state } = data;
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.updateParticipantConnectionState(socket.id, state);
+      
+      // Notify the target about connection state
+      io.to(targetSocketId).emit('peer-connection-state', {
+        fromSocketId: socket.id,
+        state: state
+      });
+
+      console.log(`Connection state between ${socket.id} and ${targetSocketId}: ${state}`);
+    });
+
+    socket.on('offer', (data) => {
+      console.log(`Offer from ${socket.id} to ${data.target}`);
+      socket.to(data.target).emit('offer', {
+        offer: data.offer,
+        sender: socket.id
+      });
+    });
+
+    socket.on('answer', (data) => {
+      console.log(`Answer from ${socket.id} to ${data.target}`);
+      socket.to(data.target).emit('answer', {
+        answer: data.answer,
+        sender: socket.id
+      });
+    });
+
+    socket.on('ice-candidate', (data) => {
+      console.log(`ICE candidate from ${socket.id} to ${data.target}`);
+      socket.to(data.target).emit('ice-candidate', {
+        candidate: data.candidate,
+        sender: socket.id
+      });
+    });
+
+    socket.on('connection-failed', (data) => {
+      const { targetSocketId } = data;
+      console.log(`Connection failed between ${socket.id} and ${targetSocketId}, attempting restart`);
+      
+      // Trigger connection restart
+      socket.emit('restart-connection', {
+        targetSocketId: targetSocketId
+      });
+      
+      socket.to(targetSocketId).emit('restart-connection', {
+        targetSocketId: socket.id
+      });
+    });
+
+    socket.on('audio-level', (data) => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const spotlightChanged = meeting.handleAudioActivity(socket.id, data.level);
+      
+      if (spotlightChanged) {
+        io.to(participantInfo.meetingId).emit('participant-spotlighted', {
+          spotlightedParticipant: meeting.spotlightedParticipant,
+          participants: Array.from(meeting.participants.values()),
+          reason: 'audio-activity'
+        });
+      }
+    });
+
+    socket.on('send-reaction', (data) => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (!participant) return;
+
+      io.to(participantInfo.meetingId).emit('reaction-received', {
+        emoji: data.emoji,
+        participantName: participant.name,
+        socketId: socket.id,
+        timestamp: data.timestamp
+      });
+
+      console.log(`Reaction ${data.emoji} sent by ${participant.name} in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('raise-hand', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (!participant) return;
+
+      meeting.raiseHand(socket.id);
+
+      io.to(participantInfo.meetingId).emit('hand-raised', {
+        socketId: socket.id,
+        participantName: participant.name,
+        raisedHands: meeting.getRaisedHands()
+      });
+
+      console.log(`${participant.name} raised hand in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('lower-hand', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (!participant) return;
+
+      meeting.lowerHand(socket.id);
+
+      io.to(participantInfo.meetingId).emit('hand-lowered', {
+        socketId: socket.id,
+        participantName: participant.name,
+        raisedHands: meeting.getRaisedHands()
+      });
+
+      console.log(`${participant.name} lowered hand in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('start-screen-share', (data) => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.addScreenShare(socket.id, data.streamId);
+      
+      socket.to(participantInfo.meetingId).emit('screen-share-started', {
+        participantId: socket.id,
+        streamId: data.streamId,
+        participantName: meeting.participants.get(socket.id)?.name
+      });
+
+      console.log(`Screen share started by ${socket.id} in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('stop-screen-share', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.removeScreenShare(socket.id);
+      
+      socket.to(participantInfo.meetingId).emit('screen-share-stopped', {
+        participantId: socket.id
+      });
+
+      console.log(`Screen share stopped by ${socket.id} in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('spotlight-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Insufficient permissions' });
+        return;
+      }
+
+      meeting.spotlightParticipant(targetSocketId);
+      
+      io.to(participantInfo.meetingId).emit('participant-spotlighted', {
+        spotlightedParticipant: targetSocketId,
+        participants: Array.from(meeting.participants.values()),
+        reason: 'manual'
+      });
+
+      console.log(`Participant ${targetSocketId} spotlighted in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('remove-spotlight', () => {
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Insufficient permissions' });
+        return;
+      }
+
+      meeting.removeSpotlight();
+      
+      io.to(participantInfo.meetingId).emit('spotlight-removed', {
+        participants: Array.from(meeting.participants.values())
+      });
+
+      console.log(`Spotlight removed in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('pin-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      socket.emit('participant-pinned', {
+        pinnedParticipant: targetSocketId
+      });
+
+      console.log(`Participant ${socket.id} pinned ${targetSocketId}`);
+    });
+
+    socket.on('mute-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Insufficient permissions' });
+        return;
+      }
+
+      const targetParticipant = meeting.participants.get(targetSocketId);
+      if (targetParticipant) {
+        targetParticipant.isMuted = !targetParticipant.isMuted;
+        
+        io.to(targetSocketId).emit('force-mute', {
+          isMuted: targetParticipant.isMuted
+        });
+        
+        io.to(participantInfo.meetingId).emit('participant-muted', {
+          targetSocketId,
+          isMuted: targetParticipant.isMuted,
+          participants: Array.from(meeting.participants.values())
+        });
+
+        console.log(`Participant ${targetSocketId} ${targetParticipant.isMuted ? 'muted' : 'unmuted'} in meeting ${participantInfo.meetingId}`);
+      }
+    });
+
+    socket.on('make-cohost', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canMakeCoHost(socket.id)) {
+        socket.emit('action-error', { message: 'Only host can make co-hosts' });
+        return;
+      }
+
+      meeting.makeCoHost(targetSocketId);
+      
+      io.to(targetSocketId).emit('made-cohost');
+      
+      io.to(participantInfo.meetingId).emit('cohost-assigned', {
+        targetSocketId,
+        participants: Array.from(meeting.participants.values())
+      });
+
+      console.log(`Participant ${targetSocketId} made co-host in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('kick-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const requester = meeting.participants.get(socket.id);
+      const target = meeting.participants.get(targetSocketId);
+      
+      if (!requester || !target) return;
+      
+      if (!requester.isHost || target.isCoHost) {
+        socket.emit('action-error', { message: 'Cannot kick this participant' });
+        return;
+      }
+
+      meeting.removeParticipant(targetSocketId);
+      participants.delete(targetSocketId);
+      
+      io.to(targetSocketId).emit('kicked-from-meeting');
+      
+      socket.to(participantInfo.meetingId).emit('participant-kicked', {
+        targetSocketId,
+        participants: Array.from(meeting.participants.values())
+      });
+
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+      if (targetSocket) {
+        targetSocket.leave(participantInfo.meetingId);
+        targetSocket.disconnect();
+      }
+
+      console.log(`Participant ${targetSocketId} kicked from meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('toggle-mic', (data) => {
+      const { isMuted } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (participant) {
+        participant.isMuted = isMuted;
+        
+        socket.to(participantInfo.meetingId).emit('participant-audio-changed', {
+          socketId: socket.id,
+          isMuted,
+          participants: Array.from(meeting.participants.values())
+        });
+      }
+    });
+
+    socket.on('toggle-camera', (data) => {
+      const { isCameraOff } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (participant) {
+        participant.isCameraOff = isCameraOff;
+        
+        socket.to(participantInfo.meetingId).emit('participant-video-changed', {
+          socketId: socket.id,
+          isCameraOff,
+          participants: Array.from(meeting.participants.values())
+        });
+      }
+    });
+
+    socket.on('disconnect', () => {
+      const participantInfo = participants.get(socket.id);
+      
+      if (participantInfo) {
+        const meeting = meetings.get(participantInfo.meetingId);
+        
+        if (meeting) {
+          const participant = meeting.participants.get(socket.id);
+          
+          meeting.removeParticipant(socket.id);
+          
+          if (participantInfo.isHost) {
+            socket.to(participantInfo.meetingId).emit('meeting-ended');
+            
+            meetings.delete(participantInfo.meetingId);
+            
+            console.log(`Meeting ${participantInfo.meetingId} ended - host disconnected`);
+          } else {
+            socket.to(participantInfo.meetingId).emit('participant-left', {
+              socketId: socket.id,
+              participantName: participant?.name,
+              participants: Array.from(meeting.participants.values())
+            });
+            
+            console.log(`Participant ${socket.id} left meeting ${participantInfo.meetingId}`);
+          }
+        }
+        
+        participants.delete(socket.id);
+      }
+      
+      console.log('User disconnected:', socket.id);
+    });
+  });
+
+  return { io, setupMeetingRoutes };
 };

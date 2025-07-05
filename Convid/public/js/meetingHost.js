@@ -1,1171 +1,953 @@
-
-      class WebRTCManager {
-        constructor(socket) {
-          this.socket = socket;
-          this.localStream = null;
-          this.screenStream = null;
-          this.peerConnections = new Map();
-          this.remoteStreams = new Map();
-          this.isScreenSharing = false;
-          this.audioContext = null;
-          this.isReady = false;
-          
-          this.configuration = {
-            iceServers: [
-              { urls: 'stun:stun.l.google.com:19302' },
-              { urls: 'stun:stun1.l.google.com:19302' }
-            ]
-          };
-
-          this.setupSocketListeners();
-        }
-
-        setupSocketListeners() {
-          this.socket.on('initiate-connection', async (data) => {
-            const { targetSocketId, shouldCreateOffer } = data;
-            console.log(`Initiating connection with ${targetSocketId}, shouldCreateOffer: ${shouldCreateOffer}`);
-            
-            if (shouldCreateOffer) {
-              await this.createPeerConnection(targetSocketId, true);
-            } else {
-              await this.createPeerConnection(targetSocketId, false);
-            }
-          });
-
-          this.socket.on('offer', async (data) => {
-            await this.handleOffer(data);
-          });
-
-          this.socket.on('answer', async (data) => {
-            await this.handleAnswer(data);
-          });
-
-          this.socket.on('ice-candidate', async (data) => {
-            await this.handleIceCandidate(data);
-          });
-        }
-
-        async initialize() {
-          try {
-            this.localStream = await navigator.mediaDevices.getUserMedia({
-              video: { 
-                width: { ideal: 1280 }, 
-                height: { ideal: 720 },
-                frameRate: { ideal: 30 }
-              },
-              audio: { 
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
-              }
-            });
-            
-            // Start audio level monitoring
-            this.startAudioLevelMonitoring();
-            
-            console.log('Local stream initialized');
-            return true;
-          } catch (error) {
-            console.error('Error accessing media devices:', error);
-            return false;
-          }
-        }
-
-        setReady() {
-          this.isReady = true;
-          this.socket.emit('participant-ready');
-        }
-
-        startAudioLevelMonitoring() {
-          if (!this.localStream) return;
-
-          try {
-            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            const analyser = this.audioContext.createAnalyser();
-            const microphone = this.audioContext.createMediaStreamSource(this.localStream);
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-            microphone.connect(analyser);
-            analyser.fftSize = 256;
-
-            const checkAudioLevel = () => {
-              if (this.audioContext.state === 'suspended') {
-                this.audioContext.resume();
-              }
-              
-              analyser.getByteFrequencyData(dataArray);
-              const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-              const normalizedLevel = average / 255;
-
-              // Send audio level to server for auto-spotlight
-              this.socket.emit('audio-level', { level: normalizedLevel });
-
-              requestAnimationFrame(checkAudioLevel);
-            };
-
-            checkAudioLevel();
-          } catch (error) {
-            console.error('Error setting up audio monitoring:', error);
-          }
-        }
-
-        async createPeerConnection(remoteSocketId, shouldCreateOffer) {
-          try {
-            console.log(`Creating peer connection with ${remoteSocketId}, shouldCreateOffer: ${shouldCreateOffer}`);
-            
-            // Close existing connection if it exists
-            if (this.peerConnections.has(remoteSocketId)) {
-              this.peerConnections.get(remoteSocketId).close();
-              this.peerConnections.delete(remoteSocketId);
-            }
-
-            const peerConnection = new RTCPeerConnection(this.configuration);
-            this.peerConnections.set(remoteSocketId, peerConnection);
-
-            // Add local stream tracks
-            if (this.localStream) {
-              this.localStream.getTracks().forEach(track => {
-                peerConnection.addTrack(track, this.localStream);
-              });
-            }
-
-            // Handle remote stream
-            peerConnection.ontrack = (event) => {
-              console.log('Received remote track from:', remoteSocketId);
-              const [remoteStream] = event.streams;
-              this.remoteStreams.set(remoteSocketId, remoteStream);
-              this.updateRemoteVideo(remoteSocketId, remoteStream);
-            };
-
-            // Handle ICE candidates
-            peerConnection.onicecandidate = (event) => {
-              if (event.candidate) {
-                this.socket.emit('ice-candidate', {
-                  target: remoteSocketId,
-                  candidate: event.candidate
-                });
-              }
-            };
-
-            // Handle connection state changes
-            peerConnection.onconnectionstatechange = () => {
-              console.log(`Connection state with ${remoteSocketId}:`, peerConnection.connectionState);
-              if (peerConnection.connectionState === 'failed') {
-                console.log(`Connection failed with ${remoteSocketId}, attempting restart`);
-                peerConnection.restartIce();
-              }
-            };
-
-            // Create and send offer if we should
-            if (shouldCreateOffer) {
-              const offer = await peerConnection.createOffer({
-                offerToReceiveAudio: true,
-                offerToReceiveVideo: true
-              });
-              await peerConnection.setLocalDescription(offer);
-              
-              this.socket.emit('offer', {
-                target: remoteSocketId,
-                offer: offer
-              });
-            }
-          } catch (error) {
-            console.error('Error creating peer connection:', error);
-          }
-        }
-
-        async handleOffer(data) {
-          const { offer, sender } = data;
-          console.log(`Handling offer from ${sender}`);
-          
-          try {
-            let peerConnection = this.peerConnections.get(sender);
-            
-            if (!peerConnection) {
-              peerConnection = new RTCPeerConnection(this.configuration);
-              this.peerConnections.set(sender, peerConnection);
-
-              // Add local stream tracks
-              if (this.localStream) {
-                this.localStream.getTracks().forEach(track => {
-                  peerConnection.addTrack(track, this.localStream);
-                });
-              }
-
-              // Handle remote stream
-              peerConnection.ontrack = (event) => {
-                console.log('Received remote track from:', sender);
-                const [remoteStream] = event.streams;
-                this.remoteStreams.set(sender, remoteStream);
-                this.updateRemoteVideo(sender, remoteStream);
-              };
-
-              // Handle ICE candidates
-              peerConnection.onicecandidate = (event) => {
-                if (event.candidate) {
-                  this.socket.emit('ice-candidate', {
-                    target: sender,
-                    candidate: event.candidate
-                  });
-                }
-              };
-
-              // Handle connection state changes
-              peerConnection.onconnectionstatechange = () => {
-                console.log(`Connection state with ${sender}:`, peerConnection.connectionState);
-                if (peerConnection.connectionState === 'failed') {
-                  console.log(`Connection failed with ${sender}, attempting restart`);
-                  peerConnection.restartIce();
-                }
-              };
-            }
-
-            // Set remote description and create answer
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-            const answer = await peerConnection.createAnswer();
-            await peerConnection.setLocalDescription(answer);
-            
-            this.socket.emit('answer', {
-              target: sender,
-              answer: answer
-            });
-          } catch (error) {
-            console.error('Error handling offer:', error);
-          }
-        }
-
-        async handleAnswer(data) {
-          const { answer, sender } = data;
-          console.log(`Handling answer from ${sender}`);
-          
-          const peerConnection = this.peerConnections.get(sender);
-          
-          if (peerConnection && peerConnection.signalingState === 'have-local-offer') {
-            try {
-              await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-            } catch (error) {
-              console.error('Error handling answer:', error);
-            }
-          }
-        }
-
-        async handleIceCandidate(data) {
-          const { candidate, sender } = data;
-          const peerConnection = this.peerConnections.get(sender);
-          
-          if (peerConnection && peerConnection.remoteDescription) {
-            try {
-              await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-            } catch (error) {
-              console.error('Error handling ICE candidate:', error);
-            }
-          }
-        }
-
-        updateRemoteVideo(socketId, stream) {
-          // Wait a bit for the DOM to be ready
-          setTimeout(() => {
-            const videoWrapper = document.querySelector(`[data-socket-id="${socketId}"]`);
-            if (videoWrapper) {
-              const video = videoWrapper.querySelector('.video-frame');
-              if (video && video.srcObject !== stream) {
-                video.srcObject = stream;
-                video.play().catch(e => console.error('Error playing video:', e));
-              }
-            }
-          }, 100);
-        }
-
-        getRemoteStream(socketId) {
-          return this.remoteStreams.get(socketId);
-        }
-
-        removePeerConnection(socketId) {
-          const peerConnection = this.peerConnections.get(socketId);
-          if (peerConnection) {
-            peerConnection.close();
-            this.peerConnections.delete(socketId);
-          }
-          this.remoteStreams.delete(socketId);
-        }
-
-        async toggleAudio(enabled) {
-          if (this.localStream) {
-            const audioTrack = this.localStream.getAudioTracks()[0];
-            if (audioTrack) {
-              audioTrack.enabled = enabled;
-            }
-          }
-        }
-
-        async toggleVideo(enabled) {
-          if (this.localStream) {
-            const videoTrack = this.localStream.getVideoTracks()[0];
-            if (videoTrack) {
-              videoTrack.enabled = enabled;
-            }
-          }
-        }
-
-        async startScreenShare() {
-          try {
-            this.screenStream = await navigator.mediaDevices.getDisplayMedia({
-              video: { cursor: 'always' },
-              audio: true
-            });
-
-            // Replace video track in all peer connections
-            const videoTrack = this.screenStream.getVideoTracks()[0];
-            
-            for (const [socketId, peerConnection] of this.peerConnections) {
-              const sender = peerConnection.getSenders().find(s => 
-                s.track && s.track.kind === 'video'
-              );
-              
-              if (sender) {
-                await sender.replaceTrack(videoTrack);
-              }
-            }
-
-            // Update local video to show screen share
-            const localVideo = document.querySelector(`[data-socket-id="${this.socket.id}"] .video-frame`);
-            if (localVideo) {
-              localVideo.srcObject = this.screenStream;
-            }
-
-            // Add screen share label
-            const localWrapper = document.querySelector(`[data-socket-id="${this.socket.id}"]`);
-            if (localWrapper) {
-              let label = localWrapper.querySelector('.video-label');
-              if (!label) {
-                label = document.createElement('div');
-                label.className = 'video-label';
-                localWrapper.appendChild(label);
-              }
-              label.innerHTML = '<i class="fas fa-desktop"></i> Screen Share';
-            }
-
-            // Handle screen share end
-            videoTrack.onended = () => {
-              this.stopScreenShare();
-            };
-
-            this.isScreenSharing = true;
-            
-          } catch (error) {
-            console.error('Error starting screen share:', error);
-            throw error;
-          }
-        }
-
-        async stopScreenShare() {
-          if (this.screenStream) {
-            this.screenStream.getTracks().forEach(track => track.stop());
-            this.screenStream = null;
-          }
-
-          // Replace back to camera video
-          if (this.localStream) {
-            const videoTrack = this.localStream.getVideoTracks()[0];
-            
-            for (const [socketId, peerConnection] of this.peerConnections) {
-              const sender = peerConnection.getSenders().find(s => 
-                s.track && s.track.kind === 'video'
-              );
-              
-              if (sender) {
-                await sender.replaceTrack(videoTrack);
-              }
-            }
-
-            // Update local video back to camera
-            const localVideo = document.querySelector(`[data-socket-id="${this.socket.id}"] .video-frame`);
-            if (localVideo) {
-              localVideo.srcObject = this.localStream;
-            }
-
-            // Remove screen share label
-            const localWrapper = document.querySelector(`[data-socket-id="${this.socket.id}"]`);
-            if (localWrapper) {
-              const label = localWrapper.querySelector('.video-label');
-              if (label) {
-                label.remove();
-              }
-            }
-          }
-
-          this.isScreenSharing = false;
-        }
-      }
-
-      class HostMeeting {
-        constructor() {
-          this.socket = io();
-          this.meetingId = window.location.pathname.split('/').pop();
-          this.userName = '';
-          this.isHost = true;
-          this.participants = new Map();
-          this.currentView = 'sidebar';
-          this.spotlightedParticipant = null;
-          this.webrtc = new WebRTCManager(this.socket);
-          this.participantsPanelOpen = false;
-          this.searchTerm = '';
-          this.reactionManager = null;
-          
-        this.init().then(() => {
-  // Store global references after initialization
-  window.hostMeetingInstance = this;
-  window.myName = this.userName;
-  console.log('Host meeting initialized. Host name:', window.myName);
-});
-        }
-
-        async init() {
-          await this.getUserName();
-          this.setupSocketListeners();
-          this.setupEventListeners();
-          this.updateTime();
-          this.joinMeeting();
-          this.showMeetingInfo();
-          
-          // Initialize WebRTC and show local video immediately
-          const initialized = await this.webrtc.initialize();
-          if (initialized) {
-            this.showLocalVideo();
-            // Set ready after a short delay to ensure everything is set up
-            setTimeout(() => {
-              this.webrtc.setReady();
-            }, 1000);
-          }
-
-          // Initialize Reaction Manager
-          this.reactionManager = new ReactionManager(this.socket);
-        }
-
-        showLocalVideo() {
-          // Create local video immediately
-          this.participants.set(this.socket.id, {
-            socketId: this.socket.id,
-            name: this.userName,
-            isHost: true,
-            isCoHost: false,
-            isMuted: false,
-            isCameraOff: false,
-            isSpotlighted: true, // Host is spotlighted by default
-            isScreenSharing: false,
-            handRaised: false
-          });
-          this.spotlightedParticipant = this.socket.id;
-          this.renderParticipants();
-          this.renderParticipantsList();
-        }
-
-        async getUserName() {
-          try {
-            const response = await fetch('/api/user');
-            const data = await response.json();
-            if (data.user) {
-              this.userName = data.user.name;
-            } else {
-              window.location.href = '/login';
-            }
-          } catch (error) {
-            console.error('Error fetching user data:', error);
-            window.location.href = '/login';
-          }
-        }
-
-        setupSocketListeners() {
-          this.socket.on('joined-meeting', (data) => {
-            console.log('Joined meeting as host:', data);
-            this.updateParticipants(data.participants);
-            this.updateMeetingTitle();
-            this.updateRaisedHands(data.raisedHands);
-          });
-
-          this.socket.on('participant-joined', (data) => {
-            console.log('Participant joined:', data);
-            this.updateParticipants(data.participants);
-            this.showToast(`${data.participant.name} joined the meeting`);
-          });
-
-          this.socket.on('participant-left', (data) => {
-            console.log('Participant left:', data);
-            this.removeParticipantVideo(data.socketId);
-            this.updateParticipants(data.participants);
-            this.showToast(`${data.participantName} left the meeting`);
-            
-            // Clean up WebRTC connection
-            this.webrtc.removePeerConnection(data.socketId);
-          });
-
-          this.socket.on('participant-spotlighted', (data) => {
-            console.log('Participant spotlighted:', data);
-            this.handleSpotlightChange(data.spotlightedParticipant);
-            this.updateParticipants(data.participants);
-          });
-
-          this.socket.on('spotlight-removed', (data) => {
-            console.log('Spotlight removed:', data);
-            this.handleSpotlightRemoved();
-            this.updateParticipants(data.participants);
-          });
-
-          this.socket.on('participant-muted', (data) => {
-            console.log('Participant muted:', data);
-            this.updateParticipantAudio(data.targetSocketId, data.isMuted);
-            this.updateParticipants(data.participants);
-          });
-
-          this.socket.on('cohost-assigned', (data) => {
-            console.log('Co-host assigned:', data);
-            this.updateParticipants(data.participants);
-            this.showToast('Co-host assigned successfully');
-          });
-
-          this.socket.on('participant-kicked', (data) => {
-            console.log('Participant kicked:', data);
-            this.removeParticipantVideo(data.targetSocketId);
-            this.updateParticipants(data.participants);
-            this.showToast('Participant removed from meeting');
-          });
-
-          this.socket.on('action-error', (data) => {
-            console.error('Action error:', data);
-            this.showToast(data.message, 'error');
-          });
-
-          // Hand raised events
-          this.socket.on('hand-raised', (data) => {
-            this.updateRaisedHands(data.raisedHands);
-            if (this.reactionManager) {
-              this.reactionManager.updateHandRaised(data.socketId, data.participantName, true);
-            }
-          });
-
-          this.socket.on('hand-lowered', (data) => {
-            this.updateRaisedHands(data.raisedHands);
-            if (this.reactionManager) {
-              this.reactionManager.updateHandRaised(data.socketId, data.participantName, false);
-            }
-          });
-        }
-
-        setupEventListeners() {
-          // Participants panel toggle
-          document.getElementById('memberToggleBtn').addEventListener('click', () => {
-            this.toggleParticipantsPanel();
-          });
-
-          document.getElementById('closeParticipants').addEventListener('click', () => {
-            this.closeParticipantsPanel();
-          });
-
-          // Search functionality
-          document.getElementById('participantSearch').addEventListener('input', (e) => {
-            this.searchTerm = e.target.value.toLowerCase();
-            this.renderParticipantsList();
-          });
-
-          // View toggle
-          document.getElementById('viewToggle').addEventListener('click', () => {
-            this.toggleView();
-          });
-
-          // Mic toggle
-          document.getElementById('micBtn').addEventListener('click', (e) => {
-            this.toggleMic(e.currentTarget);
-          });
-
-          // Camera toggle
-          document.getElementById('cameraBtn').addEventListener('click', (e) => {
-            this.toggleCamera(e.currentTarget);
-          });
-
-          // Screen share toggle
-          document.getElementById('screenShareBtn').addEventListener('click', (e) => {
-            this.toggleScreenShare(e.currentTarget);
-          });
-
-          // End call
-          document.getElementById('endCallBtn').addEventListener('click', () => {
-            this.endMeeting();
-          });
-
-          // Meeting info modal
-          document.getElementById('meetingTitle').addEventListener('click', () => {
-            this.showMeetingInfo();
-          });
-
-          document.getElementById('closeMeetingInfo').addEventListener('click', () => {
-            this.hideMeetingInfo();
-          });
-
-          document.getElementById('copyMeetingId').addEventListener('click', () => {
-            this.copyToClipboard(this.meetingId);
-          });
-
-          document.getElementById('copyJoinUrl').addEventListener('click', () => {
-            const joinUrl = `${window.location.origin}/join/${this.meetingId}`;
-            this.copyToClipboard(joinUrl);
-          });
-
-          // Close participants panel when clicking outside
-          document.addEventListener('click', (e) => {
-            if (this.participantsPanelOpen && 
-                !document.getElementById('participantsPanel').contains(e.target) &&
-                !document.getElementById('memberToggleBtn').contains(e.target)) {
-              this.closeParticipantsPanel();
-            }
-          });
-        }
-
-        updateRaisedHands(raisedHands) {
-          if (this.reactionManager) {
-            this.reactionManager.raisedHands.clear();
-            raisedHands.forEach(socketId => {
-              this.reactionManager.raisedHands.add(socketId);
-            });
-            this.reactionManager.updateParticipantsDisplay();
-          }
-        }
-
-        toggleParticipantsPanel() {
-          if (this.participantsPanelOpen) {
-            this.closeParticipantsPanel();
-          } else {
-            this.openParticipantsPanel();
-          }
-        }
-
-        
-        openParticipantsPanel() {
-          this.participantsPanelOpen = true;
-          document.getElementById('participantsPanel').classList.add('open');
-          document.getElementById('videoContainer').classList.add('participants-open');
-          this.renderParticipantsList();
-        }
-        openChatsPanel(){
-          this.participantsPanelOpen = true;
-          document.getElementById('videoContainer').classList.add('participants-open');
-        }
-        closeChatsPanel(){
-          this.participantsPanelOpen = false;
-          document.getElementById('videoContainer').classList.remove('participants-open');
-
-        }
-        closeParticipantsPanel() {
-          this.participantsPanelOpen = false;
-          document.getElementById('participantsPanel').classList.remove('open');
-          document.getElementById('videoContainer').classList.remove('participants-open');
-        }
-
-        renderParticipantsList() {
-          const participantsList = document.getElementById('participantsList');
-          const participantsPanelCount = document.getElementById('participantsPanelCount');
-          
-          participantsList.innerHTML = '';
-          
-          const filteredParticipants = Array.from(this.participants.values()).filter(participant => 
-            participant.name.toLowerCase().includes(this.searchTerm)
-          );
-
-          participantsPanelCount.textContent = filteredParticipants.length;
-
-          filteredParticipants.forEach(participant => {
-            const participantItem = this.createParticipantItem(participant);
-            participantsList.appendChild(participantItem);
-          });
-
-          // Update reaction manager if available
-          if (this.reactionManager) {
-            this.reactionManager.onParticipantsUpdated();
-          }
-        }
-
-        createParticipantItem(participant) {
-          const item = document.createElement('div');
-          item.className = 'participant-item';
-          item.dataset.socketId = participant.socketId;
-
-          const initials = participant.name.split(' ').map(n => n[0]).join('').toUpperCase();
-          
-          let roleText = 'Participant';
-          let roleClass = 'participant';
-          if (participant.isHost) {
-            roleText = 'Host';
-            roleClass = 'host';
-          } else if (participant.isCoHost) {
-            roleText = 'Co-Host';
-            roleClass = 'cohost';
-          }
-
-          const statusIcons = [];
-          if (participant.isMuted) {
-            statusIcons.push('<div class="status-icon muted"><i class="fas fa-microphone-slash"></i></div>');
-          }
-          if (participant.isCameraOff) {
-            statusIcons.push('<div class="status-icon camera-off"><i class="fas fa-video-slash"></i></div>');
-          }
-
-          const dropdownOptions = this.getParticipantDropdownOptions(participant);
-
-          item.innerHTML = `
-            <div class="participant-avatar">${initials}</div>
-            <div class="participant-info">
-              <div class="participant-name">${participant.name}</div>
-              <div class="participant-role">
-                <span class="role-badge ${roleClass}">${roleText}</span>
-                ${participant.isSpotlighted ? '<i class="fas fa-star" style="color: #fbbf24; margin-left: 4px;"></i>' : ''}
-              </div>
-            </div>
-            <div class="participant-status">
-              ${statusIcons.join('')}
-            </div>
-            <div class="participant-actions">
-              <button class="participant-menu-btn" data-participant-id="${participant.socketId}">
-                <i class="fas fa-ellipsis-v"></i>
-              </button>
-              <div class="participant-dropdown" id="dropdown-${participant.socketId}">
-                ${dropdownOptions}
-              </div>
-            </div>
-          `;
-
-          // Bind events
-          const menuBtn = item.querySelector('.participant-menu-btn');
-          const dropdown = item.querySelector('.participant-dropdown');
-
-          menuBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            // Close all other dropdowns
-            document.querySelectorAll('.participant-dropdown').forEach(d => {
-              if (d !== dropdown) d.classList.remove('show');
-            });
-            dropdown.classList.toggle('show');
-          });
-
-          // Bind dropdown actions
-          const dropdownButtons = dropdown.querySelectorAll('button');
-          dropdownButtons.forEach(button => {
-            button.addEventListener('click', (e) => {
-              e.stopPropagation();
-              const action = button.dataset.action;
-              this.handleParticipantAction(action, participant.socketId);
-              dropdown.classList.remove('show');
-            });
-          });
-
-          return item;
-        }
-
-        getParticipantDropdownOptions(participant) {
-          let options = [];
-          
-          if (participant.isSpotlighted) {
-            options.push('<button data-action="remove-spotlight"><i class="fas fa-star-half-alt"></i> Remove Spotlight</button>');
-          } else {
-            options.push('<button data-action="spotlight"><i class="fas fa-star"></i> Spotlight</button>');
-          }
-          
-          if (!participant.isHost) {
-            options.push(`<button data-action="mute"><i class="fas fa-microphone-slash"></i> ${participant.isMuted ? 'Unmute' : 'Mute'}</button>`);
-            
-            if (!participant.isCoHost) {
-              options.push('<button data-action="make-cohost"><i class="fas fa-user-shield"></i> Make Co-Host</button>');
-              options.push('<button data-action="kick" class="danger"><i class="fas fa-user-times"></i> Remove</button>');
-            }
-          }
-          
-          return options.join('');
-        }
-
-        joinMeeting() {
-          this.socket.emit('join-as-host', {
-            meetingId: this.meetingId,
-            hostName: this.userName
-          });
-        }
-
-        updateParticipants(participants) {
-          // Keep local participant if not in server list
-          const localParticipant = this.participants.get(this.socket.id);
-          
-          this.participants.clear();
-          participants.forEach(p => {
-            this.participants.set(p.socketId, p);
-          });
-
-          // Ensure local participant is always present
-          if (localParticipant && !this.participants.has(this.socket.id)) {
-            this.participants.set(this.socket.id, localParticipant);
-          }
-
-          this.renderParticipants();
-          this.updateParticipantCount();
-          if (this.participantsPanelOpen) {
-            this.renderParticipantsList();
-          }
-        }
-
-        renderParticipants() {
-          const mainVideoSection = document.getElementById('mainVideoSection');
-          const secondaryVideosSection = document.getElementById('secondaryVideosSection');
-          
-          // Clear existing videos
-          mainVideoSection.innerHTML = '';
-          secondaryVideosSection.innerHTML = '';
-
-          const participantArray = Array.from(this.participants.values());
-          
-          participantArray.forEach((participant, index) => {
-            const videoWrapper = this.createVideoWrapper(participant);
-            
-            if (participant.isSpotlighted && this.currentView === 'sidebar') {
-              videoWrapper.classList.add('main-video');
-              videoWrapper.setAttribute('data-main-video', 'true');
-              mainVideoSection.appendChild(videoWrapper);
-            } else {
-              secondaryVideosSection.appendChild(videoWrapper);
-            }
-          });
-        }
-
-        createVideoWrapper(participant) {
-          const wrapper = document.createElement('div');
-          wrapper.className = 'video-wrapper';
-          wrapper.dataset.socketId = participant.socketId;
-          
-          if (participant.isSpotlighted) {
-            wrapper.setAttribute('data-main-video', 'true');
-          }
-
-          const dropdownOptions = this.getDropdownOptions(participant);
-          
-          wrapper.innerHTML = `
-            <video class="video-frame" autoplay playsinline ${participant.socketId === this.socket.id ? 'muted' : ''}></video>
-            <div class="video-controls">
-              <button class="menu-dots">⋮</button>
-              <div class="dropdown-menu">
-                ${dropdownOptions}
-              </div>
-            </div>
-            <div class="participant-name">${participant.name}${participant.isHost ? ' (Host)' : ''}${participant.isCoHost ? ' (Co-Host)' : ''}</div>
-            ${participant.isSpotlighted ? '<div class="spotlight-badge"><i class="fas fa-star"></i></div>' : ''}
-            ${participant.isMuted ? '<div class="audio-indicator"><i class="fas fa-microphone-slash"></i></div>' : ''}
-          `;
-
-          this.bindVideoWrapperEvents(wrapper, participant);
-          
-          // Attach video stream
-          setTimeout(() => {
-            const video = wrapper.querySelector('.video-frame');
-            if (participant.socketId === this.socket.id) {
-              // Local video
-              if (this.webrtc.isScreenSharing && this.webrtc.screenStream) {
-                video.srcObject = this.webrtc.screenStream;
-              } else if (this.webrtc.localStream) {
-                video.srcObject = this.webrtc.localStream;
-              }
-              video.play().catch(e => console.error('Error playing local video:', e));
-            } else {
-              // Remote video
-              const remoteStream = this.webrtc.getRemoteStream(participant.socketId);
-              if (remoteStream) {
-                video.srcObject = remoteStream;
-                video.play().catch(e => console.error('Error playing remote video:', e));
-              }
-            }
-          }, 100);
-          
-          return wrapper;
-        }
-
-        getDropdownOptions(participant) {
-          let options = [];
-          
-          if (participant.isSpotlighted) {
-            options.push('<button data-action="remove-spotlight">Remove Spotlight</button>');
-          } else {
-            options.push('<button data-action="spotlight">Spotlight</button>');
-          }
-          
-          if (!participant.isHost) {
-            options.push(`<button data-action="mute">${participant.isMuted ? 'Unmute' : 'Mute'} Participant</button>`);
-            
-            if (!participant.isCoHost) {
-              options.push('<button data-action="make-cohost">Make Co-Host</button>');
-              options.push('<button data-action="kick">Remove from Meeting</button>');
-            }
-          }
-          
-          return options.join('');
-        }
-
-        bindVideoWrapperEvents(wrapper, participant) {
-          // Double click to spotlight
-          wrapper.addEventListener('dblclick', () => {
-            if (!participant.isSpotlighted) {
-              this.spotlightParticipant(participant.socketId);
-            }
-          });
-
-          // Dropdown menu actions
-          const dropdownButtons = wrapper.querySelectorAll('.dropdown-menu button');
-          dropdownButtons.forEach(button => {
-            button.addEventListener('click', (e) => {
-              e.stopPropagation();
-              const action = button.dataset.action;
-              this.handleParticipantAction(action, participant.socketId);
-            });
-          });
-        }
-
-        handleParticipantAction(action, socketId) {
-          switch(action) {
-            case 'spotlight':
-              this.spotlightParticipant(socketId);
-              break;
-            case 'remove-spotlight':
-              this.removeSpotlight();
-              break;
-            case 'mute':
-              this.muteParticipant(socketId);
-              break;
-            case 'make-cohost':
-              this.makeCoHost(socketId);
-              break;
-            case 'kick':
-              this.kickParticipant(socketId);
-              break;
-          }
-        }
-
-        spotlightParticipant(socketId) {
-          this.socket.emit('spotlight-participant', { targetSocketId: socketId });
-        }
-
-        removeSpotlight() {
-          this.socket.emit('remove-spotlight');
-        }
-
-        muteParticipant(socketId) {
-          this.socket.emit('mute-participant', { targetSocketId: socketId });
-        }
-
-        makeCoHost(socketId) {
-          this.socket.emit('make-cohost', { targetSocketId: socketId });
-        }
-
-        kickParticipant(socketId) {
-          const participant = this.participants.get(socketId);
-          if (participant && confirm(`Remove ${participant.name} from the meeting?`)) {
-            this.socket.emit('kick-participant', { targetSocketId: socketId });
-          }
-        }
-
-        handleSpotlightChange(spotlightedSocketId) {
-          this.spotlightedParticipant = spotlightedSocketId;
-          this.renderParticipants();
-          if (this.participantsPanelOpen) {
-            this.renderParticipantsList();
-          }
-        }
-
-        handleSpotlightRemoved() {
-          this.spotlightedParticipant = null;
-          this.renderParticipants();
-          if (this.participantsPanelOpen) {
-            this.renderParticipantsList();
-          }
-        }
-
-        removeParticipantVideo(socketId) {
-          const wrapper = document.querySelector(`[data-socket-id="${socketId}"]`);
-          if (wrapper) {
-            wrapper.style.transition = 'all 0.3s ease';
-            wrapper.style.opacity = '0';
-            wrapper.style.transform = 'scale(0.8)';
-            setTimeout(() => wrapper.remove(), 300);
-          }
-        }
-
-        updateParticipantAudio(socketId, isMuted) {
-          const wrapper = document.querySelector(`[data-socket-id="${socketId}"]`);
-          if (wrapper) {
-            let audioIndicator = wrapper.querySelector('.audio-indicator');
-            if (isMuted && !audioIndicator) {
-              audioIndicator = document.createElement('div');
-              audioIndicator.className = 'audio-indicator';
-              audioIndicator.innerHTML = '<i class="fas fa-microphone-slash"></i>';
-              wrapper.appendChild(audioIndicator);
-            } else if (!isMuted && audioIndicator) {
-              audioIndicator.remove();
-            }
-          }
-        }
-
-        toggleView() {
-          const videoContainer = document.getElementById('videoContainer');
-          const viewToggleIcon = document.getElementById('viewToggleIcon');
-          const viewToggleText = document.getElementById('viewToggleText');
-          
-          if (this.currentView === 'sidebar') {
-            this.currentView = 'grid';
-            videoContainer.classList.remove('sidebar-view');
-            videoContainer.classList.add('grid-view');
-            viewToggleIcon.className = 'fas fa-columns';
-            viewToggleText.textContent = 'Sidebar View';
-          } else {
-            this.currentView = 'sidebar';
-            videoContainer.classList.remove('grid-view');
-            videoContainer.classList.add('sidebar-view');
-            viewToggleIcon.className = 'fas fa-th';
-            viewToggleText.textContent = 'Grid View';
-          }
-          
-          this.renderParticipants();
-        }
-
-        async toggleMic(button) {
-          const isActive = button.getAttribute('data-active') === 'true';
-          button.setAttribute('data-active', !isActive);
-          
-          const icon = button.querySelector('i');
-          icon.className = isActive ? 'fas fa-microphone-slash' : 'fas fa-microphone';
-          
-          await this.webrtc.toggleAudio(!isActive);
-          this.socket.emit('toggle-mic', { isMuted: isActive });
-        }
-
-        async toggleCamera(button) {
-          const isActive = button.getAttribute('data-active') === 'true';
-          button.setAttribute('data-active', !isActive);
-          
-          const icon = button.querySelector('i');
-          icon.className = isActive ? 'fas fa-video-slash' : 'fas fa-video';
-          
-          await this.webrtc.toggleVideo(!isActive);
-          this.socket.emit('toggle-camera', { isCameraOff: isActive });
-        }
-
-        async toggleScreenShare(button) {
-          const isActive = button.getAttribute('data-active') === 'true';
-          
-          if (isActive) {
-            await this.webrtc.stopScreenShare();
-            button.setAttribute('data-active', 'false');
-            this.socket.emit('stop-screen-share');
-          } else {
-            try {
-              await this.webrtc.startScreenShare();
-              button.setAttribute('data-active', 'true');
-              this.socket.emit('start-screen-share', { streamId: 'screen' });
-            } catch (error) {
-              console.error('Failed to start screen share:', error);
-              this.showToast('Failed to start screen sharing', 'error');
-            }
-          }
-        }
-
-        updateParticipantCount() {
-          const count = this.participants.size;
-          document.getElementById('participantCount').textContent = count;
-        }
-
-        updateMeetingTitle() {
-          document.getElementById('meetingTitle').textContent = `Meeting ${this.meetingId}`;
-        }
-
-        updateTime() {
-          const timeElement = document.getElementById('meetingTime');
-          const now = new Date();
-          const timeString = now.toLocaleTimeString('en-US', { 
-            hour: '2-digit', 
-            minute: '2-digit',
-            hour12: true 
-          });
-          timeElement.textContent = timeString;
-          
-          setTimeout(() => this.updateTime(), 60000);
-        }
-
-        showMeetingInfo() {
-          document.getElementById('displayMeetingId').textContent = this.meetingId;
-          document.getElementById('displayJoinUrl').textContent = `${window.location.origin}/join/${this.meetingId}`;
-          document.getElementById('meetingInfoModal').style.display = 'flex';
-        }
-
-        hideMeetingInfo() {
-          document.getElementById('meetingInfoModal').style.display = 'none';
-        }
-
-        copyToClipboard(text) {
-          navigator.clipboard.writeText(text).then(() => {
-            this.showToast('Copied to clipboard!');
-          }).catch(() => {
-            this.showToast('Failed to copy', 'error');
-          });
-        }
-
-        showToast(message, type = 'success') {
-          const toast = document.createElement('div');
-          toast.className = `toast ${type === 'error' ? 'error' : type === 'info' ? 'info' : ''}`;
-          toast.textContent = message;
-          
-          document.body.appendChild(toast);
-          
-          setTimeout(() => toast.classList.add('show'), 100);
-          setTimeout(() => {
-            toast.classList.remove('show');
-            setTimeout(() => toast.remove(), 300);
-          }, 3000);
-        }
-
-        endMeeting() {
-          if (confirm('Are you sure you want to end the meeting for everyone?')) {
-            this.socket.disconnect();
-            window.location.href = '/dashboard';
-          }
-        }
-      }
-
-      // Close dropdowns when clicking outside
-      document.addEventListener('click', () => {
-        document.querySelectorAll('.participant-dropdown').forEach(dropdown => {
-          dropdown.classList.remove('show');
-        });
-      });
-
-      // Initialize the host meeting
-      document.addEventListener('DOMContentLoaded', () => {
-        new HostMeeting();
-      });
+import { Server as SocketIO } from 'socket.io';
+import { v4 as uuidv4 } from 'uuid';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import { authenticateUser } from './auth.js';
+
+// Fix for __dirname in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Meeting class to manage meeting state
+class Meeting {
+  constructor(id, hostId, hostName) {
+    this.id = id;
+    this.hostId = hostId;
+    this.hostName = hostName;
+    this.participants = new Map();
+    this.coHosts = new Set();
+    this.spotlightedParticipant = null;
+    this.screenShares = new Map();
+    this.createdAt = new Date();
+    this.autoSpotlightEnabled = true;
+    this.manualSpotlight = false;
+    this.raisedHands = new Set();
+    this.iceServers = this.getICEServers();
+    this.isLocked = false; // New property for meeting lock status
     
-      
-      
-      // Make host name globally accessible
-var myName = null;
-window.myName = null;
+    // Meeting permissions
+    this.permissions = {
+      chatEnabled: true,
+      fileShareEnabled: true,
+      emojiReactionsEnabled: true,
+      privateMessagesEnabled: true
+    };
+  }
 
-// Store global reference when meeting initializes  
-window.addEventListener('load', function() {
-  setTimeout(() => {
-    // Try to find the host name from various sources
-    const participantItems = document.querySelectorAll('.participant-item');
-    for (let item of participantItems) {
-      const roleElement = item.querySelector('.role-badge');
-      if (roleElement && roleElement.textContent.includes('Host')) {
-        const nameElement = item.querySelector('.participant-name');
-        if (nameElement) {
-          myName = nameElement.textContent.trim();
-          window.myName = myName;
-          console.log('myName set to:', myName);
-          return;
+  getICEServers() {
+    // Enhanced ICE servers configuration for production
+    const iceServers = [
+      // Google STUN servers
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+      
+      // Additional STUN servers for better connectivity
+      { urls: 'stun:stun.stunprotocol.org:3478' },
+      { urls: 'stun:stun.voiparound.com' },
+      { urls: 'stun:stun.voipbuster.com' },
+      { urls: 'stun:stun.voipstunt.com' },
+      { urls: 'stun:stun.voxgratia.org' },
+      
+      // OpenRelay TURN servers (free but limited)
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
+    ];
+
+    // Add environment-based TURN servers if available
+    if (process.env.TURN_SERVER_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+      iceServers.push({
+        urls: process.env.TURN_SERVER_URL,
+        username: process.env.TURN_USERNAME,
+        credential: process.env.TURN_CREDENTIAL
+      });
+    }
+
+    return iceServers;
+  }
+
+  addParticipant(socketId, name, isHost = false) {
+    const participant = {
+      socketId,
+      name,
+      isHost,
+      isCoHost: false,
+      isMuted: false,
+      isCameraOff: false,
+      isSpotlighted: false,
+      isScreenSharing: false,
+      audioLevel: 0,
+      joinedAt: new Date(),
+      isReady: false,
+      handRaised: false,
+      connectionState: 'new'
+    };
+    
+    this.participants.set(socketId, participant);
+    
+    if (isHost && !this.spotlightedParticipant) {
+      this.spotlightParticipant(socketId);
+    }
+    
+    return participant;
+  }
+
+  removeParticipant(socketId) {
+    this.participants.delete(socketId);
+    this.coHosts.delete(socketId);
+    this.screenShares.delete(socketId);
+    this.raisedHands.delete(socketId);
+    
+    if (this.spotlightedParticipant === socketId) {
+      this.spotlightedParticipant = null;
+      this.manualSpotlight = false;
+    }
+  }
+
+  setParticipantReady(socketId) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isReady = true;
+      participant.connectionState = 'ready';
+    }
+  }
+
+  updateParticipantConnectionState(socketId, state) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.connectionState = state;
+    }
+  }
+
+  getReadyParticipants() {
+    return Array.from(this.participants.values()).filter(p => p.isReady);
+  }
+
+  makeCoHost(socketId) {
+    const participant = this.participants.get(socketId);
+    if (participant && !participant.isHost) {
+      participant.isCoHost = true;
+      this.coHosts.add(socketId);
+    }
+  }
+
+  removeCoHost(socketId) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isCoHost = false;
+      this.coHosts.delete(socketId);
+    }
+  }
+
+  spotlightParticipant(socketId) {
+    if (this.spotlightedParticipant) {
+      const prevSpotlighted = this.participants.get(this.spotlightedParticipant);
+      if (prevSpotlighted) {
+        prevSpotlighted.isSpotlighted = false;
+      }
+    }
+
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isSpotlighted = true;
+      this.spotlightedParticipant = socketId;
+      this.manualSpotlight = true;
+    }
+  }
+
+  removeSpotlight() {
+    if (this.spotlightedParticipant) {
+      const participant = this.participants.get(this.spotlightedParticipant);
+      if (participant) {
+        participant.isSpotlighted = false;
+      }
+      this.spotlightedParticipant = null;
+      this.manualSpotlight = false;
+    }
+  }
+
+  handleAudioActivity(socketId, audioLevel) {
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.audioLevel = audioLevel;
+      
+      if (!this.manualSpotlight && this.autoSpotlightEnabled && audioLevel > 0.3) {
+        if (this.spotlightedParticipant !== socketId) {
+          this.spotlightParticipant(socketId);
+          this.manualSpotlight = false;
+          return true;
         }
       }
     }
-  }, 3000); // Wait 3 seconds for everything to load
-});
-const hostParticipant = Array.from(window.hostMeetingInstance.participants.values())
-    .find(p => p.isHost);
+    return false;
+  }
+
+  addScreenShare(socketId, streamId) {
+    this.screenShares.set(socketId, {
+      streamId,
+      startedAt: new Date()
+    });
+    
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isScreenSharing = true;
+    }
+  }
+
+  removeScreenShare(socketId) {
+    this.screenShares.delete(socketId);
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.isScreenSharing = false;
+    }
+  }
+
+  raiseHand(socketId) {
+    this.raisedHands.add(socketId);
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.handRaised = true;
+    }
+  }
+
+  lowerHand(socketId) {
+    this.raisedHands.delete(socketId);
+    const participant = this.participants.get(socketId);
+    if (participant) {
+      participant.handRaised = false;
+    }
+  }
+
+  getRaisedHands() {
+    return Array.from(this.raisedHands);
+  }
+
+  canPerformHostAction(socketId) {
+    const participant = this.participants.get(socketId);
+    return participant && (participant.isHost || participant.isCoHost);
+  }
+
+  canMakeCoHost(socketId) {
+    const participant = this.participants.get(socketId);
+    return participant && participant.isHost;
+  }
+
+  // New methods for meeting lock functionality
+  lockMeeting() {
+    this.isLocked = true;
+  }
+
+  unlockMeeting() {
+    this.isLocked = false;
+  }
+
+  isParticipantAllowed(socketId) {
+    // Allow if meeting is not locked or if participant is already in the meeting
+    return !this.isLocked || this.participants.has(socketId);
+  }
+
+  // New methods for permission management
+  updatePermissions(newPermissions) {
+    this.permissions = { ...this.permissions, ...newPermissions };
+  }
+
+  getPermissions() {
+    return this.permissions;
+  }
+}
+
+// Store meeting data
+const meetings = new Map();
+const participants = new Map();
+
+export const setupSocketIO = (server) => {
+  const io = new SocketIO(server, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"]
+    },
+    transports: ['websocket', 'polling'],
+    pingTimeout: 60000,
+    pingInterval: 25000
+  });
+
+  // Meeting routes
+  const setupMeetingRoutes = (app) => {
+    app.get('/host/:meetingId', authenticateUser, (req, res) => {
+      res.sendFile(path.join(__dirname, '../public', 'meetingHost.html'));
+    });
+
+    app.get('/join/:meetingId', authenticateUser, (req, res) => {
+      const { meetingId } = req.params;
+      const meeting = meetings.get(meetingId);
+      
+      // Check if meeting exists and is locked
+      if (meeting && meeting.isLocked) {
+        // Return a special locked page instead of the normal join page
+        res.sendFile(path.join(__dirname, '../public', 'meetingLocked.html'));
+        return;
+      }
+      
+      res.sendFile(path.join(__dirname, '../public', 'meetingJoin.html'));
+    });
+
+    app.post('/api/create-meeting', authenticateUser, (req, res) => {
+      const meetingId = uuidv4().substring(0, 8).toUpperCase();
+      
+      res.json({ 
+        meetingId,
+        hostUrl: `/host/${meetingId}`,
+        joinUrl: `/join/${meetingId}`
+      });
+    });
+
+    app.get('/api/meeting/:meetingId', authenticateUser, (req, res) => {
+      const { meetingId } = req.params;
+      const meeting = meetings.get(meetingId);
+      
+      if (!meeting) {
+        return res.status(404).json({ error: 'Meeting not found' });
+      }
+
+      res.json({
+        id: meeting.id,
+        hostName: meeting.hostName,
+        participantCount: meeting.participants.size,
+        createdAt: meeting.createdAt,
+        isLocked: meeting.isLocked
+      });
+    });
+
+    // ICE servers endpoint for clients
+    app.get('/api/ice-servers', authenticateUser, (req, res) => {
+      const iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+        { urls: 'stun:stun.stunprotocol.org:3478' },
+        { urls: 'stun:stun.voiparound.com' },
+        { urls: 'stun:stun.voipbuster.com' },
+        { urls: 'stun:stun.voipstunt.com' },
+        { urls: 'stun:stun.voxgratia.org' },
+        {
+          urls: 'turn:openrelay.metered.ca:80',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        }
+      ];
+
+      // Add environment-based TURN servers if available
+      if (process.env.TURN_SERVER_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+        iceServers.push({
+          urls: process.env.TURN_SERVER_URL,
+          username: process.env.TURN_USERNAME,
+          credential: process.env.TURN_CREDENTIAL
+        });
+      }
+
+      res.json({ iceServers });
+    });
+  };
+
+  // Socket.IO connection handling
+  io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
+
+    socket.on('join-as-host', (data) => {
+      const { meetingId, hostName } = data;
+      
+      const meeting = new Meeting(meetingId, socket.id, hostName);
+      meetings.set(meetingId, meeting);
+      
+      meeting.addParticipant(socket.id, hostName, true);
+      
+      socket.join(meetingId);
+      
+      participants.set(socket.id, { meetingId, isHost: true });
+      
+      socket.emit('joined-meeting', {
+        meetingId,
+        isHost: true,
+        participants: Array.from(meeting.participants.values()),
+        spotlightedParticipant: meeting.spotlightedParticipant,
+        raisedHands: meeting.getRaisedHands(),
+        iceServers: meeting.iceServers,
+        isLocked: meeting.isLocked,
+        permissions: meeting.getPermissions()
+      });
+
+      console.log(`Host ${hostName} created meeting ${meetingId}`);
+    });
+
+    socket.on('join-meeting', (data) => {
+      const { meetingId, participantName } = data;
+      const meeting = meetings.get(meetingId);
+      
+      if (!meeting) {
+        socket.emit('meeting-error', { message: 'Meeting not found' });
+        return;
+      }
+
+      // Check if meeting is locked and participant is not already in the meeting
+      if (meeting.isLocked && !meeting.participants.has(socket.id)) {
+        socket.emit('meeting-locked', { 
+          message: 'The host disabled New Entries, Meeting Inaccessible',
+          meetingId: meetingId
+        });
+        return;
+      }
+
+      meeting.addParticipant(socket.id, participantName);
+      
+      socket.join(meetingId);
+      
+      participants.set(socket.id, { meetingId, isHost: false });
+      
+      socket.emit('joined-meeting', {
+        meetingId,
+        isHost: false,
+        participants: Array.from(meeting.participants.values()),
+        spotlightedParticipant: meeting.spotlightedParticipant,
+        screenShares: Array.from(meeting.screenShares.entries()),
+        raisedHands: meeting.getRaisedHands(),
+                chatEnabled: e.target.checked
+              });
+            });
+          }
+
+          // File sharing permission toggle
+          const fileShareToggle = document.querySelector('#chat .setting-item:nth-child(3) input[type="checkbox"]');
+          if (fileShareToggle) {
+            fileShareToggle.addEventListener('change', (e) => {
+              this.updateMeetingPermissions({
+                fileShareEnabled: e.target.checked
+              });
+            });
+          }
+
+          // Emoji reactions permission toggle
+          const emojiToggle = document.querySelector('#chat .setting-item:last-child input[type="checkbox"]');
+          if (emojiToggle) {
+            emojiToggle.addEventListener('change', (e) => {
+              this.updateMeetingPermissions({
+                emojiReactionsEnabled: e.target.checked
+              });
+            });
+          }
+        }
+
+        updateMeetingPermissions(permissions) {
+          this.socket.emit('update-meeting-permissions', {
+            permissions: permissions
+          });
+          
+          // Show feedback to host
+          const permissionName = Object.keys(permissions)[0];
+          const isEnabled = Object.values(permissions)[0];
+          let displayName = permissionName;
+          
+          if (permissionName === 'chatEnabled') displayName = 'Chat';
+          else if (permissionName === 'fileShareEnabled') displayName = 'File Sharing';
+          else if (permissionName === 'emojiReactionsEnabled') displayName = 'Emoji Reactions';
+          
+          this.showToast(`${displayName} ${isEnabled ? 'enabled' : 'disabled'} for all participants`);
+        }
+
+        iceServers: meeting.iceServers,
+        isLocked: meeting.isLocked
+      });
+
+      socket.to(meetingId).emit('participant-joined', {
+        participant: meeting.participants.get(socket.id),
+        participants: Array.from(meeting.participants.values())
+      });
+
+      console.log(`Participant ${participantName} joined meeting ${meetingId}`);
+    });
+
+    // New socket event for locking/unlocking meeting
+    socket.on('toggle-meeting-lock', (data) => {
+      const { isLocked } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Only host can lock/unlock the meeting' });
+        return;
+      }
+
+      if (isLocked) {
+        meeting.lockMeeting();
+      } else {
+        meeting.unlockMeeting();
+      }
+
+      // Notify all participants about the lock status change
+      io.to(participantInfo.meetingId).emit('meeting-lock-changed', {
+        isLocked: meeting.isLocked,
+        changedBy: meeting.participants.get(socket.id)?.name
+      });
+
+      console.log(`Meeting ${participantInfo.meetingId} ${isLocked ? 'locked' : 'unlocked'} by ${socket.id}`);
+    });
+
+    socket.on('participant-ready', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.setParticipantReady(socket.id);
+      
+      const readyParticipants = meeting.getReadyParticipants();
+      
+      // Create connections with all ready participants
+      readyParticipants.forEach(participant => {
+        if (participant.socketId !== socket.id) {
+          // Send connection initiation to both parties
+          io.to(participant.socketId).emit('initiate-connection', {
+            targetSocketId: socket.id,
+            shouldCreateOffer: true,
+            iceServers: meeting.iceServers
+          });
+          
+          socket.emit('initiate-connection', {
+            targetSocketId: participant.socketId,
+            shouldCreateOffer: false,
+            iceServers: meeting.iceServers
+          });
+        }
+      });
+
+      console.log(`Participant ${socket.id} is ready for WebRTC connections`);
+    });
+
+    socket.on('connection-state-change', (data) => {
+      const { targetSocketId, state } = data;
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.updateParticipantConnectionState(socket.id, state);
+      
+      // Notify the target about connection state
+      io.to(targetSocketId).emit('peer-connection-state', {
+        fromSocketId: socket.id,
+        state: state
+      });
+
+      console.log(`Connection state between ${socket.id} and ${targetSocketId}: ${state}`);
+    });
+
+    socket.on('offer', (data) => {
+      console.log(`Offer from ${socket.id} to ${data.target}`);
+      socket.to(data.target).emit('offer', {
+        offer: data.offer,
+        sender: socket.id
+      });
+    });
+
+    socket.on('answer', (data) => {
+      console.log(`Answer from ${socket.id} to ${data.target}`);
+      socket.to(data.target).emit('answer', {
+        answer: data.answer,
+        sender: socket.id
+      });
+    });
+
+    socket.on('ice-candidate', (data) => {
+      console.log(`ICE candidate from ${socket.id} to ${data.target}`);
+      socket.to(data.target).emit('ice-candidate', {
+        candidate: data.candidate,
+        sender: socket.id
+      });
+    });
+
+    socket.on('connection-failed', (data) => {
+      const { targetSocketId } = data;
+      console.log(`Connection failed between ${socket.id} and ${targetSocketId}, attempting restart`);
+      
+      // Trigger connection restart
+      socket.emit('restart-connection', {
+        targetSocketId: targetSocketId
+      });
+      
+      socket.to(targetSocketId).emit('restart-connection', {
+        targetSocketId: socket.id
+      });
+    });
+
+    socket.on('audio-level', (data) => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const spotlightChanged = meeting.handleAudioActivity(socket.id, data.level);
+      
+      if (spotlightChanged) {
+        io.to(participantInfo.meetingId).emit('participant-spotlighted', {
+          spotlightedParticipant: meeting.spotlightedParticipant,
+          participants: Array.from(meeting.participants.values()),
+          reason: 'audio-activity'
+        });
+      }
+    });
+
+    socket.on('send-reaction', (data) => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (!participant) return;
+
+      io.to(participantInfo.meetingId).emit('reaction-received', {
+        emoji: data.emoji,
+        participantName: participant.name,
+        socketId: socket.id,
+        timestamp: data.timestamp
+      });
+
+      console.log(`Reaction ${data.emoji} sent by ${participant.name} in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('raise-hand', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (!participant) return;
+
+      meeting.raiseHand(socket.id);
+
+      io.to(participantInfo.meetingId).emit('hand-raised', {
+        socketId: socket.id,
+        participantName: participant.name,
+        raisedHands: meeting.getRaisedHands()
+      });
+
+      console.log(`${participant.name} raised hand in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('lower-hand', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (!participant) return;
+
+      meeting.lowerHand(socket.id);
+
+      io.to(participantInfo.meetingId).emit('hand-lowered', {
+        socketId: socket.id,
+        participantName: participant.name,
+        raisedHands: meeting.getRaisedHands()
+      });
+
+      console.log(`${participant.name} lowered hand in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('start-screen-share', (data) => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.addScreenShare(socket.id, data.streamId);
+      
+      socket.to(participantInfo.meetingId).emit('screen-share-started', {
+        participantId: socket.id,
+        streamId: data.streamId,
+        participantName: meeting.participants.get(socket.id)?.name
+      });
+
+      console.log(`Screen share started by ${socket.id} in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('stop-screen-share', () => {
+      const participantInfo = participants.get(socket.id);
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      meeting.removeScreenShare(socket.id);
+      
+      socket.to(participantInfo.meetingId).emit('screen-share-stopped', {
+        participantId: socket.id
+      });
+
+      console.log(`Screen share stopped by ${socket.id} in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('spotlight-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Insufficient permissions' });
+        return;
+      }
+
+      meeting.spotlightParticipant(targetSocketId);
+      
+      io.to(participantInfo.meetingId).emit('participant-spotlighted', {
+        spotlightedParticipant: targetSocketId,
+        participants: Array.from(meeting.participants.values()),
+        reason: 'manual'
+      });
+
+      console.log(`Participant ${targetSocketId} spotlighted in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('remove-spotlight', () => {
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Insufficient permissions' });
+        return;
+      }
+
+      meeting.removeSpotlight();
+      
+      io.to(participantInfo.meetingId).emit('spotlight-removed', {
+        participants: Array.from(meeting.participants.values())
+      });
+
+      console.log(`Spotlight removed in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('pin-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      socket.emit('participant-pinned', {
+        pinnedParticipant: targetSocketId
+      });
+
+      console.log(`Participant ${socket.id} pinned ${targetSocketId}`);
+    });
+
+    socket.on('mute-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canPerformHostAction(socket.id)) {
+        socket.emit('action-error', { message: 'Insufficient permissions' });
+        return;
+      }
+
+      const targetParticipant = meeting.participants.get(targetSocketId);
+      if (targetParticipant) {
+        targetParticipant.isMuted = !targetParticipant.isMuted;
+        
+        io.to(targetSocketId).emit('force-mute', {
+          isMuted: targetParticipant.isMuted
+        });
+        
+        io.to(participantInfo.meetingId).emit('participant-muted', {
+          targetSocketId,
+          isMuted: targetParticipant.isMuted,
+          participants: Array.from(meeting.participants.values())
+        });
+
+        console.log(`Participant ${targetSocketId} ${targetParticipant.isMuted ? 'muted' : 'unmuted'} in meeting ${participantInfo.meetingId}`);
+      }
+    });
+
+    socket.on('make-cohost', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting || !meeting.canMakeCoHost(socket.id)) {
+        socket.emit('action-error', { message: 'Only host can make co-hosts' });
+        return;
+      }
+
+      meeting.makeCoHost(targetSocketId);
+      
+      io.to(targetSocketId).emit('made-cohost');
+      
+      io.to(participantInfo.meetingId).emit('cohost-assigned', {
+        targetSocketId,
+        participants: Array.from(meeting.participants.values())
+      });
+
+      console.log(`Participant ${targetSocketId} made co-host in meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('kick-participant', (data) => {
+      const { targetSocketId } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const requester = meeting.participants.get(socket.id);
+      const target = meeting.participants.get(targetSocketId);
+      
+      if (!requester || !target) return;
+      
+      if (!requester.isHost || target.isCoHost) {
+        socket.emit('action-error', { message: 'Cannot kick this participant' });
+        return;
+      }
+
+      meeting.removeParticipant(targetSocketId);
+      participants.delete(targetSocketId);
+      
+      io.to(targetSocketId).emit('kicked-from-meeting');
+      
+      socket.to(participantInfo.meetingId).emit('participant-kicked', {
+        targetSocketId,
+        participants: Array.from(meeting.participants.values())
+      });
+
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+      if (targetSocket) {
+        targetSocket.leave(participantInfo.meetingId);
+        targetSocket.disconnect();
+      }
+
+      console.log(`Participant ${targetSocketId} kicked from meeting ${participantInfo.meetingId}`);
+    });
+
+    socket.on('toggle-mic', (data) => {
+      const { isMuted } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (participant) {
+        participant.isMuted = isMuted;
+        
+        socket.to(participantInfo.meetingId).emit('participant-audio-changed', {
+          socketId: socket.id,
+          isMuted,
+          participants: Array.from(meeting.participants.values())
+        });
+      }
+    });
+
+    socket.on('toggle-camera', (data) => {
+      const { isCameraOff } = data;
+      const participantInfo = participants.get(socket.id);
+      
+      if (!participantInfo) return;
+      
+      const meeting = meetings.get(participantInfo.meetingId);
+      if (!meeting) return;
+
+      const participant = meeting.participants.get(socket.id);
+      if (participant) {
+        participant.isCameraOff = isCameraOff;
+        
+        socket.to(participantInfo.meetingId).emit('participant-video-changed', {
+          socketId: socket.id,
+          isCameraOff,
+          participants: Array.from(meeting.participants.values())
+        });
+      }
+    });
+
+    socket.on('disconnect', () => {
+      const participantInfo = participants.get(socket.id);
+      
+      if (participantInfo) {
+        const meeting = meetings.get(participantInfo.meetingId);
+        
+        if (meeting) {
+          const participant = meeting.participants.get(socket.id);
+          
+          meeting.removeParticipant(socket.id);
+          
+          if (participantInfo.isHost) {
+            socket.to(participantInfo.meetingId).emit('meeting-ended');
+            
+            meetings.delete(participantInfo.meetingId);
+            
+            console.log(`Meeting ${participantInfo.meetingId} ended - host disconnected`);
+          } else {
+            socket.to(participantInfo.meetingId).emit('participant-left', {
+              socketId: socket.id,
+              participantName: participant?.name,
+              participants: Array.from(meeting.participants.values())
+            });
+            
+            console.log(`Participant ${socket.id} left meeting ${participantInfo.meetingId}`);
+          }
+        }
+        
+        participants.delete(socket.id);
+      }
+      
+      console.log('User disconnected:', socket.id);
+    });
+  });
+
+  return { io, setupMeetingRoutes };
+};
